@@ -185,12 +185,12 @@ class PacedInputTransport(BaseInputTransport):
                     f"{self}: 🎤 SENDING REAL AUDIO: {total} bytes, sr={sr}, ch={num_channels}, "
                     f"first 20 bytes: {list(audio_bytes[:20])}"
                 )
-            else:
-                # Log silence sending (only log once per silence period to avoid spam)
-                # if chunk_idx == 0:
-                #     logger.debug(
-                #         f"{self}: 🔇 Sending silence chunk ({silence_chunk_bytes} bytes)"
-                #     )
+            # else:
+            #     # Log silence sending (only log once per silence period to avoid spam)
+            #     if chunk_idx == 0:
+            #         logger.debug(
+            #             f"{self}: 🔇 Sending silence chunk ({silence_chunk_bytes} bytes)"
+            #         )
 
             while offset < total and not self._stop.is_set():
                 end = min(offset + chunk_bytes, total)

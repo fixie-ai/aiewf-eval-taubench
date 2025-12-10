@@ -46,18 +46,22 @@ class TTSStoppedAssistantTranscriptProcessor(AssistantTranscriptProcessor):
                 self._aggregation_start_time = time_now_iso8601()
                 logger.info(f"[TRANSCRIPT] Started aggregation at {self._aggregation_start_time}")
             # AssistantTranscriptProcessor expects TextPartForConcatenation items
+            # OpenAI Realtime tokens include their own spacing (e.g., " is", " June")
             self._current_text_parts.append(
-                TextPartForConcatenation(text, includes_inter_part_spaces=False)
+                TextPartForConcatenation(text, includes_inter_part_spaces=True)
             )
             await self.push_frame(frame, direction)
         elif isinstance(frame, (TTSStoppedFrame, LLMFullResponseEndFrame)):
             # Flush aggregated text on audio stop or text response end
             logger.info(f"[TRANSCRIPT] Received flush frame: {type(frame).__name__}")
-            total_text = (
-                concatenate_aggregated_text(self._current_text_parts)
-                if hasattr(self, "_current_text_parts")
-                else ""
+            # Simple join and normalize whitespace - OpenAI Realtime tokens may have
+            # irregular spacing (e.g., " " tokens before numbers)
+            raw_text = "".join(
+                p.text for p in getattr(self, "_current_text_parts", [])
             )
+            # Normalize multiple spaces to single space
+            import re
+            total_text = re.sub(r' +', ' ', raw_text).strip()
             logger.info(f"[TRANSCRIPT] Flushing {len(total_text)} chars of aggregated text")
             await self._emit_aggregated_text()
             # Also emit a TranscriptionUpdateFrame so external transcript handlers (e.g., in convo-test) fire

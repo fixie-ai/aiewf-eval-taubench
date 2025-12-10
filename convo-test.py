@@ -39,13 +39,8 @@ from pipecat.services.llm_service import FunctionCallParams
 import pipecat.services.openai.realtime.events as rt_events
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.processors.aggregators.llm_response import LLMAssistantAggregatorParams
-from pipecat.processors.aggregators.openai_llm_context import (
-    OpenAILLMContext,
-)
-from pipecat.processors.aggregators.llm_response import (
-    OpenAILLMContextAssistantTimestampFrame,
-)
 from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.frames.frames import LLMContextAssistantTimestampFrame
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 
 
@@ -165,23 +160,9 @@ recorder: Optional[RunRecorder] = None
 
 async def function_catchall(params: FunctionCallParams):
     logger.info(f"Function call: {params}")
-    # Record tool calls/results
-    global recorder
-    try:
-        name = getattr(params, "function_name", None)
-        args = getattr(params, "arguments", {})
-        if recorder:
-            recorder.record_tool_call(
-                str(name), dict(args) if isinstance(args, dict) else {"raw": str(args)}
-            )
-    except Exception:
-        pass
+    # Note: Tool call recording is handled by ToolCallRecorder in the pipeline.
+    # We only need to return the result here.
     result = {"status": "success"}
-    try:
-        if recorder and name:
-            recorder.record_tool_result(str(name), result)
-    except Exception:
-        pass
     await params.result_callback(result)
 
 
@@ -201,7 +182,7 @@ class NextTurn(FrameProcessor):
             self.metrics_callback(frame)
 
         # Treat assistant timestamp frame as end-of-turn marker
-        if isinstance(frame, OpenAILLMContextAssistantTimestampFrame):
+        if isinstance(frame, LLMContextAssistantTimestampFrame):
             logger.info("EOT (timestamp)")
             await self.end_of_turn_callback()
 
@@ -219,7 +200,7 @@ class RealtimeEOTShim(FrameProcessor):
 
     async def push_eot_frames(self):
         await asyncio.sleep(0.5)
-        ts = OpenAILLMContextAssistantTimestampFrame(timestamp=time_now_iso8601())
+        ts = LLMContextAssistantTimestampFrame(timestamp=time_now_iso8601())
         await self.push_frame(ts)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -304,6 +285,12 @@ async def main():
         session_props = rt_events.SessionProperties(
             instructions=system_instruction,
             tools=ToolsSchemaForTest,
+            turn_detection={
+                "type": "server_vad",  # Use server-side Voice Activity Detection
+                "threshold": 0.5,      # Activation threshold (0.0-1.0), higher requires louder audio
+                "prefix_padding_ms": 300, # Audio to include before VAD detects speech
+                "silence_duration_ms": 1500 # Silence duration to detect speech stop; lower values lead to quicker responses
+            }
         )
         llm = OpenAIRealtimeLLMService(
             api_key=api_key,
@@ -373,10 +360,8 @@ async def main():
             {"role": "user", "content": turns[turn_idx]["input"]},
         ]
 
-    context = OpenAILLMContext(messages, tools=ToolsSchemaForTest)
-    context_aggregator = llm.create_context_aggregator(
-        context, assistant_params=LLMAssistantAggregatorParams(expect_stripped_words=False)
-    )
+    context = LLMContext(messages, tools=ToolsSchemaForTest)
+    context_aggregator = LLMContextAggregatorPair(context)
 
     # Track index into context messages to extract per-turn assistant text
     last_msg_idx = len(messages)
@@ -388,42 +373,34 @@ async def main():
 
     done = False
 
-    async def end_of_turn():
+    async def end_of_turn(direct_assistant_text: str = None):
         nonlocal turn_idx, last_msg_idx, done
         if done:
             logger.info("!!!! EOT top (done)")
             await llm.push_frame(CancelFrame())
             return
 
-        # Extract assistant text added since last user message
-        msgs = context.get_messages()
-        logger.info(f"!!!Context (up-to-last): {msgs[:last_msg_idx]}")
-        # Start from the index right after the last user message we queued
-        start_i = last_msg_idx
-        new_msgs = msgs[start_i:]
-        assistant_chunks: List[str] = []
-        for m in new_msgs:
-            logger.info(f"!!!New message: {m}")
-            if hasattr(m, "parts"):
-                # Google -- we should be using the new LLMContext so we don't need to do this
-                part = m.parts[0]
-                if part.text:
-                    assistant_chunks.append(part.text)
-            elif m.get("role") == "assistant" and m.get("content"):
-                # content may be str or list
-                if isinstance(m["content"], str):
-                    assistant_chunks.append(m["content"])
-                elif isinstance(m["content"], list):
-                    # concatenate text parts
-                    assistant_chunks.extend(
-                        [p.get("text", "") for p in m["content"] if isinstance(p, dict)]
-                    )
-        assistant_text = "\n".join([c for c in assistant_chunks if c])
+        # For realtime models, use the direct text passed from transcript handler
+        # For text models, context_aggregator.assistant() has already added the
+        # complete assistant message to context by the time we get here
+        if direct_assistant_text is not None:
+            assistant_text = direct_assistant_text
+        else:
+            # context_aggregator.assistant() adds the assistant message as the last entry
+            msgs = context.get_messages()
+            assistant_text = ""
+            if msgs and msgs[-1].get("role") == "assistant":
+                content = msgs[-1].get("content", "")
+                assistant_text = content if isinstance(content, str) else ""
 
         recorder.write_turn(
             user_text=turns[turn_idx].get("input", ""),
             assistant_text=assistant_text,
         )
+
+        # Update last_msg_idx to current position so next turn only captures new messages
+        msgs = context.get_messages()
+        last_msg_idx = len(msgs)
 
         turn_idx += 1
         if turn_idx < len(turns):
@@ -548,7 +525,8 @@ async def main():
                 llm,  # LLM
                 llm_logger,  # debug: log all frames from LLM
                 ToolCallRecorder(current_recorder),
-                assistant_shim,  # flushes only on TTSStoppedFrame
+                assistant_shim,  # flushes only on TTSStoppedFrame - MUST be before context_aggregator.assistant() to see TTSTextFrames
+                context_aggregator.assistant(),
             ]
         )
     else:
@@ -580,10 +558,11 @@ async def main():
                 timestamp = f"[{msg.timestamp}] " if msg.timestamp else ""
                 line = f"{timestamp}{msg.role}: {msg.content}"
                 logger.info(f"Transcript: {line}")
-                context.add_messages([{"role": "assistant", "content": msg.content}])
+                # Note: Don't add to context here - context_aggregator.assistant() already does that
                 # Small delay to let downstream settle, then next turn
                 await asyncio.sleep(1.0)
-                await end_of_turn()
+                # Pass the assistant text directly to avoid race with context_aggregator
+                await end_of_turn(direct_assistant_text=msg.content)
 
     async def queue_audio_for_first_turn(delay=1.0):
         # Give the pipeline a moment to start, then enqueue paced audio
