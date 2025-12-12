@@ -125,13 +125,191 @@ class NovaSonicLLMServiceWithCompletionSignal(AWSNovaSonicLLMService):
     1. Tracks the current content being received (type, role, generationStage)
     2. Emits NovaSonicTextTurnEndFrame when FINAL TEXT ends with END_TURN
     3. Emits NovaSonicCompletionEndFrame when the session's completionEnd arrives
+    4. Emits TTFB metrics (time from trigger to first audio)
+    5. Supports Nova 2 Sonic VAD configuration (endpointingSensitivity)
+    6. Overrides reset_conversation() with retry limits to prevent infinite error cascade
     """
 
-    def __init__(self, **kwargs):
+    def __init__(
+        self,
+        endpointing_sensitivity: str = None,
+        max_reconnect_attempts: int = 3,
+        on_reconnecting: Optional[Callable[[], None]] = None,
+        on_reconnected: Optional[Callable[[], None]] = None,
+        on_retriggered: Optional[Callable[[], None]] = None,
+        **kwargs,
+    ):
+        """Initialize the Nova Sonic service.
+
+        Args:
+            endpointing_sensitivity: VAD sensitivity for Nova 2 Sonic only.
+                Options: "HIGH" (quick cutoff), "MEDIUM" (default), "LOW" (longer wait).
+                Only applicable to amazon.nova-2-sonic-v1:0 model.
+                Nova Sonic v1 does not support this parameter.
+            max_reconnect_attempts: Maximum reconnection attempts before giving up.
+            on_reconnecting: Callback when reconnection starts (pause audio input).
+            on_reconnected: Callback when reconnection completes (resume audio input).
+            on_retriggered: Callback after assistant response is re-triggered (signal turn detector).
+        """
         super().__init__(**kwargs)
         self._current_content_type = None
         self._current_content_role = None
         self._current_generation_stage = None
+        self._ttfb_started = False  # Track if we've started TTFB timing for this turn
+        self._endpointing_sensitivity = endpointing_sensitivity
+
+        # Reconnection handling
+        self._max_reconnect_attempts = max_reconnect_attempts
+        self._reconnect_attempts = 0
+        self._is_reconnecting = False
+        self._need_retrigger_after_reconnect = False
+        self._on_reconnecting = on_reconnecting
+        self._on_reconnected = on_reconnected
+        self._on_retriggered = on_retriggered
+
+    def can_generate_metrics(self) -> bool:
+        """Enable metrics generation for TTFB tracking.
+
+        The base FrameProcessor returns False by default, which prevents
+        start_ttfb_metrics() and stop_ttfb_metrics() from working.
+        """
+        return True
+
+    def is_reconnecting(self) -> bool:
+        """Check if currently reconnecting (for external coordination)."""
+        return self._is_reconnecting
+
+    def reset_reconnect_counter(self):
+        """Reset the reconnection attempt counter (call on successful turn completion)."""
+        if self._reconnect_attempts > 0:
+            logger.info(f"Resetting reconnect counter (was {self._reconnect_attempts})")
+        self._reconnect_attempts = 0
+
+    async def reset_conversation(self):
+        """Override to add retry limits and preserve trigger state.
+
+        The base class calls this automatically when errors occur in the receive task.
+        Without retry limits, connection errors can cascade infinitely.
+
+        Key improvements:
+        1. Retry limits - gives up after max_reconnect_attempts
+        2. Preserves trigger state - re-triggers assistant response after reconnection
+        3. Callbacks - notifies external components to pause/resume audio input
+        """
+        # Check retry limit
+        if self._reconnect_attempts >= self._max_reconnect_attempts:
+            logger.error(
+                f"Max reconnect attempts ({self._max_reconnect_attempts}) reached. "
+                f"Giving up on reconnection."
+            )
+            await self.push_error(
+                error_msg=f"Nova Sonic: Max reconnect attempts ({self._max_reconnect_attempts}) exceeded"
+            )
+            self._wants_connection = False
+            return
+
+        self._reconnect_attempts += 1
+        self._is_reconnecting = True
+
+        logger.warning(
+            f"Nova Sonic reset_conversation() attempt {self._reconnect_attempts}/{self._max_reconnect_attempts}"
+        )
+
+        # Remember if we need to re-trigger after reconnection
+        # This is lost in _disconnect() so we must capture it here
+        self._need_retrigger_after_reconnect = (
+            self._triggering_assistant_response or self._assistant_is_responding
+        )
+        logger.info(
+            f"Nova Sonic: Will re-trigger after reconnect: {self._need_retrigger_after_reconnect} "
+            f"(triggering={self._triggering_assistant_response}, responding={self._assistant_is_responding})"
+        )
+
+        # Notify external components to pause audio input
+        if self._on_reconnecting:
+            try:
+                self._on_reconnecting()
+            except Exception as e:
+                logger.warning(f"Error in on_reconnecting callback: {e}")
+
+        # Call parent implementation (handles disconnect/reconnect/context reload)
+        try:
+            await super().reset_conversation()
+        except Exception as e:
+            logger.exception(f"Error in parent reset_conversation: {e}")
+            self._is_reconnecting = False
+            raise
+
+        self._is_reconnecting = False
+
+        # Notify external components reconnection is complete
+        if self._on_reconnected:
+            try:
+                self._on_reconnected()
+            except Exception as e:
+                logger.warning(f"Error in on_reconnected callback: {e}")
+
+        # Re-trigger assistant response if we were in the middle of one
+        if self._need_retrigger_after_reconnect:
+            logger.info("Nova Sonic: Re-triggering assistant response after reconnection")
+            # Small delay to let connection stabilize
+            await asyncio.sleep(0.5)
+            await self.trigger_assistant_response()
+            self._need_retrigger_after_reconnect = False
+
+            # Notify turn detector that we've triggered
+            if self._on_retriggered:
+                try:
+                    self._on_retriggered()
+                except Exception as e:
+                    logger.warning(f"Error in on_retriggered callback: {e}")
+
+    async def _send_session_start_event(self):
+        """Override to add endpointingSensitivity for Nova 2 Sonic VAD control.
+
+        Nova 2 Sonic supports VAD configuration via endpointingSensitivity:
+        - HIGH: Very sensitive to pauses (quick cutoff)
+        - MEDIUM: Balanced sensitivity (default)
+        - LOW: Less sensitive to pauses (longer wait before cutoff)
+
+        Nova Sonic v1 does not support this parameter.
+        """
+        # Build inference configuration
+        inference_config = {
+            "maxTokens": self._params.max_tokens,
+            "topP": self._params.top_p,
+            "temperature": self._params.temperature,
+        }
+
+        # Add endpointingSensitivity for Nova 2 Sonic
+        if self._endpointing_sensitivity:
+            inference_config["endpointingSensitivity"] = self._endpointing_sensitivity
+            logger.info(f"NovaSonicLLM: Using endpointingSensitivity={self._endpointing_sensitivity}")
+
+        session_start = json.dumps({
+            "event": {
+                "sessionStart": {
+                    "inferenceConfiguration": inference_config
+                }
+            }
+        })
+        await self._send_client_event(session_start)
+
+    async def start_ttfb_for_user_audio_complete(self):
+        """Start TTFB timing when user audio delivery is complete.
+
+        This should be called when the last byte of user audio has been
+        delivered to the model. TTFB = time from this point to first model audio.
+        """
+        logger.info("NovaSonicLLM: Starting TTFB metrics (user audio complete)")
+        await self.start_ttfb_metrics()
+        self._ttfb_started = True
+        self._audio_output_count = 0  # Reset for new turn
+
+    async def trigger_assistant_response(self):
+        """Override to trigger assistant response."""
+        logger.info("NovaSonicLLM: Triggering assistant response")
+        await super().trigger_assistant_response()
 
     async def _handle_completion_start_event(self, event_json):
         """Log when a new completion starts."""
@@ -156,28 +334,91 @@ class NovaSonicLLMServiceWithCompletionSignal(AWSNovaSonicLLMService):
         else:
             self._current_generation_stage = None
 
-        logger.debug(
-            f"NovaSonicLLM: contentStart type={self._current_content_type} "
-            f"role={self._current_content_role} stage={self._current_generation_stage}"
+        # Track content block depth
+        if not hasattr(self, '_content_depth'):
+            self._content_depth = 0
+        self._content_depth += 1
+
+        logger.info(
+            f"NovaSonicLLM: >>> contentStart [{self._content_depth}] "
+            f"type={self._current_content_type} role={self._current_content_role} "
+            f"stage={self._current_generation_stage}"
         )
         await super()._handle_content_start_event(event_json)
 
+    async def _handle_text_output_event(self, event_json):
+        """Log text output events and emit SPECULATIVE text for transcription."""
+        text_output = event_json.get("textOutput", {})
+        content = text_output.get("content", "")
+
+        # Log the text
+        logger.debug(
+            f"NovaSonicLLM:     textOutput type={self._current_content_type} "
+            f"role={self._current_content_role} stage={self._current_generation_stage} "
+            f"content={content[:80]!r}..."
+        )
+
+        # Emit SPECULATIVE ASSISTANT text as TTSTextFrame for transcription
+        # This arrives in real-time with audio, unlike FINAL which is delayed 30+ seconds
+        if (self._current_content_role == "ASSISTANT" and
+            self._current_generation_stage == "SPECULATIVE" and
+            content):
+            from pipecat.frames.frames import TTSTextFrame, AggregationType
+            logger.info(f"NovaSonicLLM: Emitting SPECULATIVE text ({len(content)} chars): {content[:60]}...")
+            frame = TTSTextFrame(content, aggregated_by=AggregationType.SENTENCE)
+            await self.push_frame(frame)
+
+        await super()._handle_text_output_event(event_json)
+
+    async def _handle_audio_output_event(self, event_json):
+        """Log audio output events and capture TTFB on first audio."""
+        if not hasattr(self, '_audio_output_count'):
+            self._audio_output_count = 0
+        self._audio_output_count += 1
+
+        # Stop TTFB metrics on first audio output (this is the "first byte" for speech-to-speech)
+        if self._audio_output_count == 1 and self._ttfb_started:
+            logger.info("NovaSonicLLM: Stopping TTFB metrics on first audio output")
+            await self.stop_ttfb_metrics()
+            self._ttfb_started = False
+
+        if self._audio_output_count == 1 or self._audio_output_count % 50 == 0:
+            logger.info(
+                f"NovaSonicLLM:     audioOutput #{self._audio_output_count} "
+                f"role={self._current_content_role}"
+            )
+        await super()._handle_audio_output_event(event_json)
+
     async def _handle_content_end_event(self, event_json):
-        """Detect when FINAL TEXT ends with END_TURN - this is the turn's transcript end."""
+        """Detect when AUDIO ends with END_TURN - this signals the turn is complete.
+
+        Since we're using SPECULATIVE text (which arrives with audio), we use AUDIO END_TURN
+        as the turn completion signal instead of waiting for FINAL text.
+        """
         content_end = event_json.get("contentEnd", {})
         stop_reason = content_end.get("stopReason", "?")
 
-        # Check for FINAL ASSISTANT TEXT with END_TURN - transcript complete for this turn
-        if (self._current_content_type == "TEXT" and
+        # Track content block depth
+        if not hasattr(self, '_content_depth'):
+            self._content_depth = 0
+        depth_before = self._content_depth
+        self._content_depth = max(0, self._content_depth - 1)
+
+        logger.debug(
+            f"NovaSonicLLM: <<< contentEnd [{depth_before}→{self._content_depth}] "
+            f"type={self._current_content_type} role={self._current_content_role} "
+            f"stage={self._current_generation_stage} stopReason={stop_reason}"
+        )
+
+        # Check for AUDIO with END_TURN - this means the assistant is done speaking
+        # Since we capture SPECULATIVE text (which arrives with audio), this is our turn end signal
+        if (self._current_content_type == "AUDIO" and
             self._current_content_role == "ASSISTANT" and
-            self._current_generation_stage == "FINAL" and
             stop_reason == "END_TURN"):
             logger.info(
-                f"NovaSonicLLM: *** TEXT TURN END *** FINAL text with END_TURN - pushing signal"
+                f"NovaSonicLLM: *** AUDIO TURN END *** Assistant audio complete - pushing signal"
             )
             await self.push_frame(NovaSonicTextTurnEndFrame())
-        else:
-            logger.debug(f"NovaSonicLLM: contentEnd stopReason={stop_reason}")
 
         # Clear tracking
         self._current_content_type = None
@@ -289,30 +530,20 @@ class NovaSonicTurnEndDetector(FrameProcessor):
             if self._response_text:
                 self._start_timeout_check()
 
-        # Handle Nova Sonic text turn end signal - transcript is now complete!
-        # This is the most reliable signal that all text for this turn has arrived.
-        elif isinstance(frame, NovaSonicTextTurnEndFrame):
-            logger.info(
-                f"NovaSonicTurnEndDetector: *** TEXT TURN END *** received! "
-                f"Text collected: {len(self._response_text)} chars. Triggering turn end."
-            )
-            self._text_turn_ended = True
-            # Cancel any pending timeout - we're ending the turn now
-            if self._timeout_task:
-                self._timeout_task.cancel()
-                self._timeout_task = None
-            # Trigger turn end immediately since we know the transcript is complete
-            asyncio.create_task(self._handle_text_turn_end())
-
-        # Watch for text frames - this is the key signal for Nova Sonic
-        # Only accept text when we're actively waiting for/receiving a response
-        # This prevents late-arriving text from previous responses from being counted
+        # Watch for text frames FIRST - process text before checking turn end signals
+        # This ensures we capture text that arrives in the same batch as the turn end signal
         if isinstance(frame, TTSTextFrame):
             text = getattr(frame, "text", None)
             if text:
-                # Only accept text if we're waiting for response OR already receiving one
-                # AND not currently processing a turn end
-                if (self._waiting_for_response or self._response_active) and not self._processing_turn_end:
+                # Accept text if:
+                # - We're waiting for response OR already receiving one
+                # - OR we received the text turn end signal (collecting late text)
+                # AND not currently in the final turn end processing
+                can_accept = (
+                    (self._waiting_for_response or self._response_active or self._text_turn_ended)
+                    and not self._processing_turn_end
+                )
+                if can_accept:
                     logger.info(
                         f"NovaSonicTurnEndDetector: Processing text ({len(text)} chars): {text[:100]}..."
                     )
@@ -325,6 +556,22 @@ class NovaSonicTurnEndDetector(FrameProcessor):
                         f"waiting={self._waiting_for_response}, active={self._response_active}, "
                         f"processing={self._processing_turn_end}"
                     )
+
+        # Handle Nova Sonic text turn end signal - transcript is now complete!
+        # This is the most reliable signal that all text for this turn has arrived.
+        # Process AFTER text frames so we capture text in the same batch.
+        if isinstance(frame, NovaSonicTextTurnEndFrame):
+            logger.info(
+                f"NovaSonicTurnEndDetector: *** TEXT TURN END *** received! "
+                f"Text collected: {len(self._response_text)} chars."
+            )
+            self._text_turn_ended = True
+            # Cancel any pending timeout - we're ending the turn now
+            if self._timeout_task:
+                self._timeout_task.cancel()
+                self._timeout_task = None
+            # Use a short delay to let any remaining text frames be processed
+            asyncio.create_task(self._handle_text_turn_end())
 
         await self.push_frame(frame, direction)
 
@@ -354,12 +601,13 @@ class NovaSonicTurnEndDetector(FrameProcessor):
     async def _handle_text_turn_end(self):
         """Handle turn end when NovaSonicTextTurnEndFrame is received.
 
-        This is the most reliable way to know the transcript is complete.
-        We give a very short delay (0.5s) to collect any remaining text that
-        might be in flight, then end the turn.
+        Since we now use SPECULATIVE text (which arrives with audio), we only need
+        a short delay after AUDIO END_TURN to collect any remaining text chunks.
         """
-        # Short delay to collect any text still in transit
-        await asyncio.sleep(0.5)
+        # Short delay - SPECULATIVE text arrives with audio, so by the time
+        # AUDIO END_TURN fires, most text should already be captured
+        logger.info("NovaSonicTurnEndDetector: AUDIO END_TURN received, waiting 1s for final text...")
+        await asyncio.sleep(1.0)
 
         # Guard against concurrent turn completions
         if self._processing_turn_end:
@@ -583,8 +831,23 @@ class RunRecorder:
         self.turn_ttfb_ms = None
 
     def record_ttfb(self, ttfb_seconds: float):
+        ttfb_ms = int(ttfb_seconds * 1000)
+        logger.debug(f"TurnRecorder: record_ttfb called with {ttfb_seconds:.3f}s ({ttfb_ms}ms), current={self.turn_ttfb_ms}")
         if self.turn_ttfb_ms is None:
-            self.turn_ttfb_ms = int(ttfb_seconds * 1000)
+            self.turn_ttfb_ms = ttfb_ms
+            logger.debug(f"TurnRecorder: set turn_ttfb_ms = {ttfb_ms}")
+        else:
+            logger.debug(f"TurnRecorder: IGNORING - already set to {self.turn_ttfb_ms}")
+
+    def reset_ttfb(self):
+        """Reset TTFB to None, allowing it to be set again.
+
+        Call this when starting TTFB timing for a new turn to ensure
+        spurious TTFB values from pipeline initialization don't interfere.
+        """
+        if self.turn_ttfb_ms is not None:
+            logger.debug(f"TurnRecorder: Resetting TTFB (was {self.turn_ttfb_ms})")
+        self.turn_ttfb_ms = None
 
     def record_usage_metrics(self, m: LLMTokenUsage, model: Optional[str] = None):
         self.turn_usage = {
@@ -692,13 +955,20 @@ class FrameLogger(FrameProcessor):
 # -------------------------
 
 
-async def main(model_name: str, max_turns: Optional[int] = None):
+async def main(model_name: str, max_turns: Optional[int] = None, vad_sensitivity: Optional[str] = None):
     turn_idx = 0
 
     # Validate model name
     n = model_name.lower()
     if "nova-sonic" not in n and "nova_sonic" not in n:
         logger.warning(f"Model '{model_name}' may not be a Nova Sonic model. Proceeding anyway.")
+
+    # Warn about VAD sensitivity on Nova Sonic v1
+    if vad_sensitivity and "nova-2-sonic" not in model_name.lower():
+        logger.warning(
+            f"VAD sensitivity '{vad_sensitivity}' is only supported by Nova 2 Sonic. "
+            f"Model '{model_name}' may ignore this parameter."
+        )
 
     # AWS credentials
     aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
@@ -729,6 +999,7 @@ async def main(model_name: str, max_turns: Optional[int] = None):
         voice_id="tiffany",
         system_instruction=nova_sonic_system_instruction,
         tools=ToolsSchemaForTest,
+        endpointing_sensitivity=vad_sensitivity,  # VAD control for Nova 2 Sonic
     )
     llm.register_function(None, function_catchall)
 
@@ -778,6 +1049,10 @@ async def main(model_name: str, max_turns: Optional[int] = None):
             assistant_text=assistant_text,
         )
 
+        # Reset reconnect counter on successful turn completion
+        # This allows fresh reconnection attempts for subsequent turns
+        llm.reset_reconnect_counter()
+
         turn_idx += 1
 
         # Check if we should continue - respect max_turns limit
@@ -790,6 +1065,11 @@ async def main(model_name: str, max_turns: Optional[int] = None):
             audio_path = turns[turn_idx].get("audio_file")
             if audio_path and paced_input:
                 try:
+                    # Wait before starting next turn to let Nova Sonic settle
+                    # This helps avoid "I didn't catch that" recognition errors
+                    logger.info("Waiting 3s before starting next turn...")
+                    await asyncio.sleep(3.0)
+
                     # Calculate audio duration to know when it will finish streaming
                     data, sr = sf.read(audio_path, dtype="int16")
                     audio_duration_sec = len(data) / sr
@@ -802,6 +1082,10 @@ async def main(model_name: str, max_turns: Optional[int] = None):
                     wait_time = audio_duration_sec + 0.5
                     logger.info(f"Waiting {wait_time:.2f}s for audio to finish streaming...")
                     await asyncio.sleep(wait_time)
+
+                    # Start TTFB timing now that user audio is complete
+                    recorder.reset_ttfb()  # Clear any spurious TTFB from earlier
+                    await llm.start_ttfb_for_user_audio_complete()
 
                     await llm.trigger_assistant_response()
                     turn_detector.signal_trigger_sent()
@@ -837,17 +1121,18 @@ async def main(model_name: str, max_turns: Optional[int] = None):
             logger.info("Conversation complete!")
             recorder.write_summary()
             done = True
-            await llm.push_frame(CancelFrame())
+            # Cancel the task to properly shut down the pipeline
+            await task.cancel()
 
     # Create turn detector
     # Strategy:
-    # - Before completionEnd: use long 8-second timeout (text chunks have gaps)
-    # - After completionEnd: use short 3-second timeout (all text should be arriving)
-    # - Response timeout: 60 seconds (Nova Sonic can take a while to start)
+    # - We use SPECULATIVE text which arrives in real-time with audio
+    # - AUDIO END_TURN signals when the assistant is done speaking
+    # - Short timeout after audio ends to collect any final text chunks
     turn_detector = NovaSonicTurnEndDetector(
         end_of_turn_callback=end_of_turn,
-        text_timeout_sec=8.0,  # Before completionEnd: wait 8s after last text
-        post_completion_timeout_sec=3.0,  # After completionEnd: wait 3s for stragglers
+        text_timeout_sec=5.0,  # Fallback: wait 5s after last text if no END_TURN
+        post_completion_timeout_sec=2.0,  # After audio stops: wait 2s for stragglers
         response_timeout_sec=60.0,  # If no response within 60s after trigger, skip
         metrics_callback=handle_metrics,
     )
@@ -866,6 +1151,29 @@ async def main(model_name: str, max_turns: Optional[int] = None):
         continuous_silence=True,
         wait_for_ready=True,  # Wait for LLM to be ready before sending audio
     )
+
+    # Set up reconnection callbacks now that paced_input and turn_detector exist
+    # These callbacks coordinate audio pause/resume during Nova Sonic reconnection
+    def on_reconnecting():
+        """Called when Nova Sonic starts reconnecting - pause audio input."""
+        logger.info("Reconnection starting: pausing audio input and resetting turn detector")
+        paced_input.pause()
+        turn_detector.reset_for_reconnection()
+
+    def on_reconnected():
+        """Called when Nova Sonic reconnection completes - resume audio input."""
+        logger.info("Reconnection complete: resuming audio input")
+        paced_input.signal_ready()
+
+    def on_retriggered():
+        """Called after assistant response is re-triggered - notify turn detector."""
+        logger.info("Assistant response re-triggered after reconnection, signaling turn detector")
+        turn_detector.signal_trigger_sent()
+
+    # Set the callbacks on the LLM (they're closures that capture paced_input and turn_detector)
+    llm._on_reconnecting = on_reconnecting
+    llm._on_reconnected = on_reconnected
+    llm._on_retriggered = on_retriggered
 
     # Recorder accessor for ToolCallRecorder
     def current_recorder():
@@ -900,54 +1208,35 @@ async def main(model_name: str, max_turns: Optional[int] = None):
         ),
     )
 
-    # Track reconnection state to avoid duplicate handling
-    reconnecting = False
-    RECONNECTION_DELAY = 3.0  # Seconds to wait for Pipecat to reconnect
-
     @task.event_handler("on_error")
     async def handle_task_error(error: ErrorFrame):
         """Handle errors at the PipelineTask level.
 
-        This catches ErrorFrames that flow upstream to the task source,
-        including Nova Sonic timeout errors. When we detect a timeout,
-        Pipecat automatically reconnects - we just need to reset state
-        and re-trigger the assistant response.
+        NOTE: Reconnection is now handled automatically by our overridden
+        reset_conversation() in NovaSonicLLMServiceWithCompletionSignal.
+        This handler just logs errors and handles graceful termination
+        when max reconnect attempts are exceeded.
         """
-        nonlocal turn_idx, done, reconnecting
+        nonlocal done
 
         error_msg = getattr(error, "error", "") or ""
 
-        # Check for Nova Sonic timeout
-        if "timed out" in error_msg.lower() and not done:
-            if reconnecting:
-                logger.debug("handle_task_error: Already reconnecting, skipping")
-                return
+        # Check for max reconnect attempts exceeded
+        if "max reconnect attempts" in error_msg.lower():
+            logger.error(f"handle_task_error: Max reconnect attempts exceeded, terminating")
+            done = True
+            recorder.write_summary()
+            await task.cancel()
+            return
 
-            reconnecting = True
-            try:
-                logger.warning(
-                    f"handle_task_error: Nova Sonic timeout detected on turn {turn_idx}. "
-                    f"Pipecat will auto-reconnect, waiting {RECONNECTION_DELAY}s then re-triggering..."
-                )
-
-                # Reset turn detector state
-                turn_detector.reset_for_reconnection()
-
-                # Wait for Pipecat to reconnect and reload context
-                await asyncio.sleep(RECONNECTION_DELAY)
-
-                # Re-trigger assistant response for current turn
-                if not done:
-                    logger.info(f"handle_task_error: Re-triggering assistant response for turn {turn_idx}")
-                    await llm.trigger_assistant_response()
-                    turn_detector.signal_trigger_sent()
-                    logger.info(f"handle_task_error: Successfully re-triggered turn {turn_idx}")
-            except Exception as e:
-                logger.exception(f"handle_task_error: Failed to handle reconnection: {e}")
-            finally:
-                reconnecting = False
+        # Log all errors (reconnection is handled by LLM's reset_conversation)
+        if "timed out" in error_msg.lower():
+            logger.info(
+                f"handle_task_error: Nova Sonic timeout on turn {turn_idx}. "
+                f"Reconnection handled by LLM service."
+            )
         else:
-            logger.warning(f"handle_task_error: Non-timeout error: {error_msg[:200]}")
+            logger.warning(f"handle_task_error: Error: {error_msg[:200]}")
 
     async def queue_first_turn(delay: float = 1.0):
         """Queue the first turn - send user question as AUDIO, then trigger."""
@@ -980,6 +1269,10 @@ async def main(model_name: str, max_turns: Optional[int] = None):
             logger.info(f"Waiting {wait_time:.2f}s for audio to finish streaming...")
             await asyncio.sleep(wait_time)
 
+            # Start TTFB timing now that user audio is complete
+            recorder.reset_ttfb()  # Clear any spurious TTFB from initialization
+            await llm.start_ttfb_for_user_audio_complete()
+
             # NOW trigger assistant response (after user audio is sent)
             logger.info("Triggering assistant response after user audio...")
             await llm.trigger_assistant_response()
@@ -1005,6 +1298,14 @@ if __name__ == "__main__":
 Examples:
     uv run python convo-test-nova-sonic.py
     uv run python convo-test-nova-sonic.py --model amazon.nova-sonic-v1:0
+    uv run python convo-test-nova-sonic.py --model amazon.nova-2-sonic-v1:0 --vad-sensitivity LOW
+
+VAD Configuration (Nova 2 Sonic only):
+    Nova Sonic v1 does NOT support VAD configuration.
+    Nova 2 Sonic supports endpointingSensitivity:
+    - HIGH:   Very sensitive to pauses (quick cutoff, may interrupt user)
+    - MEDIUM: Balanced sensitivity (default)
+    - LOW:    Less sensitive to pauses (longer wait before cutoff)
 
 Environment variables:
     AWS_ACCESS_KEY_ID     - AWS access key (required)
@@ -1024,10 +1325,18 @@ Environment variables:
         default=None,
         help="Maximum number of turns to run (default: all turns)",
     )
+    parser.add_argument(
+        "--vad-sensitivity",
+        choices=["HIGH", "MEDIUM", "LOW"],
+        default="HIGH",
+        help="VAD endpointing sensitivity (Nova 2 Sonic only). LOW = longer wait before cutoff. Default: HIGH",
+    )
 
     args = parser.parse_args()
 
     logger.info(f"Running Nova Sonic test with model: {args.model}")
     if args.max_turns:
         logger.info(f"Limiting to {args.max_turns} turns")
-    asyncio.run(main(args.model, max_turns=args.max_turns))
+    if args.vad_sensitivity:
+        logger.info(f"VAD sensitivity: {args.vad_sensitivity}")
+    asyncio.run(main(args.model, max_turns=args.max_turns, vad_sensitivity=args.vad_sensitivity))

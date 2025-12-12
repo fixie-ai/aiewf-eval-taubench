@@ -23,6 +23,7 @@ from pipecat.frames.frames import (
     InputAudioRawFrame,
     LLMRunFrame,
     LLMMessagesAppendFrame,
+    LLMContextFrame,
 )
 from pipecat.metrics.metrics import (
     LLMUsageMetricsData,
@@ -237,6 +238,8 @@ async def main():
         n = (name or "").lower()
         return (
             n.startswith("meta-llama")
+            or n.startswith("z-ai")
+            or n.startswith("qwen")
             or n.startswith("openrouter")
             or n.startswith("openai/")
             or n.startswith("qwen/")
@@ -267,11 +270,13 @@ async def main():
                 silence_duration_ms=1500,  # Silence duration to detect speech stop
             ),
         )
+        # Note: Do NOT pass system_instruction and tools here - they should come
+        # from the context. If passed both here and in context, GeminiLiveLLMService
+        # will reconnect on every context update, causing "Connected to Gemini service"
+        # to appear on each turn.
         llm = GeminiLiveLLMService(
             api_key=api_key,
             model=m,
-            system_instruction=system_instruction,
-            tools=ToolsSchemaForTest,
             params=gemini_live_params,
         )
     elif is_google_model(model_name):
@@ -335,7 +340,7 @@ async def main():
         api_key = os.getenv("OPENROUTER_API_KEY")
         if not api_key:
             raise EnvironmentError("OPENROUTER_API_KEY is required for OpenRouter models")
-        # params = BaseOpenAILLMService.InputParams(extra=extra)
+        params = BaseOpenAILLMService.InputParams(extra=extra)
         llm = OpenAILLMService(
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1",
@@ -346,7 +351,7 @@ async def main():
         # Default to OpenAI-compatible endpoint using OPENAI_API_KEY
         if model_name.startswith("gpt-5"):
             extra["service_tier"] = "priority"
-            if model_name == "gpt-5.1":
+            if model_name == "gpt-5.1" or model_name == "gpt-5.2":
                 logger.info("Setting reasoning_effort to none for gpt-5.1")
                 extra["reasoning_effort"] = "none"
             else:
@@ -360,8 +365,13 @@ async def main():
     recorder = RunRecorder(model_name=model_name)
     recorder.start_turn(turn_idx)
 
-    if is_openai_realtime_model(model_name) or is_gemini_live_model(model_name):
+    if is_openai_realtime_model(model_name):
+        # OpenAI Realtime: system instruction passed via session_properties
         messages = []
+    elif is_gemini_live_model(model_name):
+        # Gemini Live: system instruction must be in context messages (not constructor)
+        # This allows the context to be pushed to the LLM and applied without reconnecting
+        messages = [{"role": "system", "content": system_instruction}]
     else:
         messages = [
             {"role": "system", "content": system_instruction},
@@ -395,15 +405,18 @@ async def main():
         if params.function_name == "end_session":
             logger.info("end_session tool called - gracefully ending run")
             done = True
-            # Small delay to let ToolCallRecorder process the FunctionCallResultFrame
-            await asyncio.sleep(0.1)
-            # Write the final turn (assistant response is empty since it's just a tool call)
-            recorder.write_turn(
-                user_text=turns[turn_idx].get("input", ""),
-                assistant_text="",
-            )
-            recorder.write_summary()
+            # Push CancelFrame immediately to prevent LLM from generating follow-up response
             await llm.push_frame(CancelFrame())
+            # Small delay to let tool call frames propagate through ToolCallRecorder
+            await asyncio.sleep(0.05)
+            # Write the final turn (assistant response is empty since it's just a tool call)
+            # Guard against turn_idx being out of bounds (can happen if end_of_turn already ran)
+            if turn_idx < len(turns):
+                recorder.write_turn(
+                    user_text=turns[turn_idx].get("input", ""),
+                    assistant_text="",
+                )
+            recorder.write_summary()
 
     # Register the function handler for all tools
     llm.register_function(None, function_catchall)
@@ -633,6 +646,11 @@ async def main():
     # Queue first user turn
     last_msg_idx = len(messages)
     if is_openai_realtime_model(model_name) or is_gemini_live_model(model_name):
+        if is_gemini_live_model(model_name):
+            # For Gemini Live, push context frame BEFORE audio to initialize the LLM
+            # with system instruction and tools. This triggers ONE reconnect at startup
+            # (to apply context settings) rather than reconnecting on each tool call.
+            await task.queue_frames([LLMContextFrame(context)])
         # For Realtime, avoid sending a context frame that would force an early
         # response.create; let audio + explicit stop drive turn boundaries.
         asyncio.create_task(queue_audio_for_first_turn())

@@ -113,6 +113,24 @@ class PacedInputTransport(BaseInputTransport):
             logger.info(f"{self}: LLM signaled ready, starting audio transmission")
             self._llm_ready.set()
 
+    def pause(self):
+        """Pause audio transmission by clearing the ready signal.
+
+        Call this during reconnection to prevent audio from being sent to a
+        disconnected or reconnecting LLM. Call signal_ready() to resume.
+        """
+        if self._llm_ready.is_set():
+            logger.info(f"{self}: Pausing audio transmission")
+            self._llm_ready.clear()
+            # Also clear any pending audio in the queue to avoid sending stale audio
+            while not self._buf_queue.empty():
+                try:
+                    self._buf_queue.get_nowait()
+                    self._buf_queue.task_done()
+                except queue.Empty:
+                    break
+            logger.info(f"{self}: Audio queue cleared")
+
     # Lifecycle hooks
     async def start(self, frame: StartFrame):
         # Initialize base input transport (sets sample_rate, VAD, etc.)
@@ -186,6 +204,13 @@ class PacedInputTransport(BaseInputTransport):
             )
 
         while not self._stop.is_set():
+            # Check if we should wait for LLM ready (supports pause/resume during reconnection)
+            if self._wait_for_ready and not self._llm_ready.is_set():
+                logger.debug(f"{self}: Waiting for LLM ready signal (paused)...")
+                self._llm_ready.wait(timeout=0.5)  # Check periodically so we can respond to stop
+                if not self._llm_ready.is_set():
+                    continue  # Still not ready, check stop flag and try again
+
             try:
                 audio_bytes, num_channels = self._buf_queue.get(timeout=0.02)
                 has_audio = True
