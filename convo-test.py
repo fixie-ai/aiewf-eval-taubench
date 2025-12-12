@@ -171,14 +171,6 @@ class RunRecorder:
 recorder: Optional[RunRecorder] = None
 
 
-async def function_catchall(params: FunctionCallParams):
-    logger.info(f"Function call: {params}")
-    # Note: Tool call recording is handled by ToolCallRecorder in the pipeline.
-    # We only need to return the result here.
-    result = {"status": "success"}
-    await params.result_callback(result)
-
-
 class NextTurn(FrameProcessor):
     def __init__(
         self, end_of_turn_callback: Callable, metrics_callback: Callable[[MetricsFrame], None]
@@ -282,14 +274,12 @@ async def main():
             tools=ToolsSchemaForTest,
             params=gemini_live_params,
         )
-        llm.register_function(None, function_catchall)
     elif is_google_model(model_name):
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
             raise EnvironmentError("GOOGLE_API_KEY is required for Google models")
         # Google service handles its own adapter and can upgrade OpenAI context under the hood
         llm = GoogleLLMService(api_key=api_key, model=model_name)
-        llm.register_function(None, function_catchall)
     elif is_openai_realtime_model(model_name):
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -320,7 +310,6 @@ async def main():
             system_instruction=system_instruction,
             session_properties=session_props,
         )
-        llm.register_function(None, function_catchall)
     elif is_bedrock_model(model_name):
         try:
             # Import lazily to avoid requiring AWS deps for non-Bedrock runs
@@ -342,7 +331,6 @@ async def main():
             aws_region=aws_region,
             model=model_name,
         )
-        llm.register_function(None, function_catchall)
     elif is_openrouter_model(model_name):
         api_key = os.getenv("OPENROUTER_API_KEY")
         if not api_key:
@@ -354,7 +342,6 @@ async def main():
             model=model_name,
             params=params,
         )
-        llm.register_function(None, function_catchall)
     else:
         # Default to OpenAI-compatible endpoint using OPENAI_API_KEY
         if model_name.startswith("gpt-5"):
@@ -367,7 +354,6 @@ async def main():
                 extra["reasoning_effort"] = "minimal"
         params = BaseOpenAILLMService.InputParams(extra=extra)
         llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model=model_name, params=params)
-        llm.register_function(None, function_catchall)
 
     # Set up recorder
     global recorder
@@ -396,6 +382,31 @@ async def main():
                 recorder.record_ttfb(md.value)
 
     done = False
+
+    async def function_catchall(params: FunctionCallParams):
+        nonlocal done, turn_idx
+        logger.info(f"Function call: {params}")
+        # Note: Tool call recording is handled by ToolCallRecorder in the pipeline.
+        # We only need to return the result here.
+        result = {"status": "success"}
+        await params.result_callback(result)
+
+        # Handle end_session specially - gracefully end the run
+        if params.function_name == "end_session":
+            logger.info("end_session tool called - gracefully ending run")
+            done = True
+            # Small delay to let ToolCallRecorder process the FunctionCallResultFrame
+            await asyncio.sleep(0.1)
+            # Write the final turn (assistant response is empty since it's just a tool call)
+            recorder.write_turn(
+                user_text=turns[turn_idx].get("input", ""),
+                assistant_text="",
+            )
+            recorder.write_summary()
+            await llm.push_frame(CancelFrame())
+
+    # Register the function handler for all tools
+    llm.register_function(None, function_catchall)
 
     async def end_of_turn(direct_assistant_text: str = None):
         nonlocal turn_idx, last_msg_idx, done

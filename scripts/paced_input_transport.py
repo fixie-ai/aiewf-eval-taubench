@@ -42,9 +42,18 @@ class PacedInputTransport(BaseInputTransport):
     - Chops into 20 ms chunks at `params.audio_in_sample_rate`.
     - Feeds InputAudioRawFrame to the pipeline at realtime pace.
     - No VAD, no mixing; relies on BaseInputTransport to forward frames.
+    - Supports wait_for_ready mode where audio is held until signal_ready() is called.
     """
 
-    def __init__(self, params: TransportParams, *, chunk_ms: int = 20, pre_roll_ms: int = 0, continuous_silence: bool = False):
+    def __init__(
+        self,
+        params: TransportParams,
+        *,
+        chunk_ms: int = 20,
+        pre_roll_ms: int = 0,
+        continuous_silence: bool = False,
+        wait_for_ready: bool = False,
+    ):
         super().__init__(params)
         self._chunk_ms = chunk_ms
         self._pre_roll_ms = max(0, int(pre_roll_ms))
@@ -55,6 +64,10 @@ class PacedInputTransport(BaseInputTransport):
         self._num_channels = params.audio_in_channels or 1
         self._did_preroll = False
         self._continuous_silence = continuous_silence  # Send silence when no audio queued
+        self._wait_for_ready = wait_for_ready  # If True, wait for signal_ready() before sending audio
+        self._llm_ready = threading.Event()  # Signaled when downstream LLM is ready to receive audio
+        if not wait_for_ready:
+            self._llm_ready.set()  # If not waiting, consider LLM ready immediately
 
     # Public API
     def enqueue_wav_file(self, path: str):
@@ -90,6 +103,16 @@ class PacedInputTransport(BaseInputTransport):
         # We only store bytes; channel count kept alongside
         self._buf_queue.put((audio, num_channels))
 
+    def signal_ready(self):
+        """Signal that the downstream LLM is ready to receive audio.
+
+        Call this after the LLM has established its session/prompt with the server.
+        Until this is called (when wait_for_ready=True), no audio frames will be sent.
+        """
+        if not self._llm_ready.is_set():
+            logger.info(f"{self}: LLM signaled ready, starting audio transmission")
+            self._llm_ready.set()
+
     # Lifecycle hooks
     async def start(self, frame: StartFrame):
         # Initialize base input transport (sets sample_rate, VAD, etc.)
@@ -118,6 +141,13 @@ class PacedInputTransport(BaseInputTransport):
     def _feeder_loop(self):
         # Wait until pipeline signals StartFrame
         self._ready.wait()
+
+        # If wait_for_ready mode, wait for LLM to signal it's ready before sending any audio
+        if self._wait_for_ready and not self._llm_ready.is_set():
+            logger.info(f"{self}: Waiting for LLM ready signal before sending audio...")
+            self._llm_ready.wait()
+            logger.info(f"{self}: LLM ready signal received, proceeding with audio")
+
         sr = self.sample_rate or (self._params.audio_in_sample_rate or 16000)
         bytes_per_sample = 2  # int16
 
