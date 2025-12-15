@@ -42,6 +42,7 @@ MODEL_MAPPINGS = {
     "gemini-2.5-flash-native-audio-preview-12-2025": "gemini-native-audio-12",
     "gemini-2.5-flash-native-audio-preview-09-2025": "gemini-native-audio-09",
     "gpt-realtime": "gpt-realtime",
+    "amazon.nova-2-sonic-v1_0": "nova-sonic",
 }
 
 
