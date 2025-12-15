@@ -893,6 +893,11 @@ class NovaSonicPipeline:
         self.model_name = None
         self._turn_indices = None
 
+        # Track tool calls to detect duplicates within a turn
+        self._seen_tool_calls: set = set()
+        # Track tool_call_ids that are duplicates (for filtering in ToolCallRecorder)
+        self._duplicate_tool_call_ids: set = set()
+
         # Nova Sonic specific
         self.paced_input = None
         self.turn_detector = None
@@ -1107,24 +1112,68 @@ class NovaSonicPipeline:
             wait_for_ready=True,  # Wait for LLM to be ready before sending audio
         )
 
+        # Track interrupted turn state for reconnection handling
+        self._interrupted_turn_text = ""
+        self._was_responding_at_disconnect = False
+
         # Set up reconnection callbacks
         def on_reconnecting():
             logger.info("Reconnection starting: pausing audio input and resetting turn detector")
             self.paced_input.pause()
+
+            # Capture accumulated text and response state BEFORE reset
+            # We need this to handle interrupted turns after reconnection
+            self._interrupted_turn_text = self.turn_detector._response_text or ""
+            self._was_responding_at_disconnect = self.turn_detector._response_active
+
+            if self._was_responding_at_disconnect:
+                logger.warning(
+                    f"Turn {self.turn_idx} interrupted mid-response. "
+                    f"Captured {len(self._interrupted_turn_text)} chars before reset."
+                )
+
             self.turn_detector.reset_for_reconnection()
 
         def on_reconnected():
             logger.info("Reconnection complete: waiting 2s before resuming audio")
             import threading
+            import asyncio
 
-            def delayed_signal():
+            def delayed_resume():
                 import time
 
                 time.sleep(2.0)
                 logger.info("Delayed audio resume: signaling ready now")
                 self.paced_input.signal_ready()
 
-            threading.Thread(target=delayed_signal, daemon=True).start()
+                # If we were mid-response when disconnected, we need to:
+                # 1. Complete the interrupted turn (with whatever text was collected)
+                # 2. This will trigger _queue_next_turn() to queue the next turn's audio
+                if self._was_responding_at_disconnect:
+                    logger.warning(
+                        f"Handling interrupted turn {self.turn_idx} after reconnection. "
+                        f"Text captured: {len(self._interrupted_turn_text)} chars"
+                    )
+                    time.sleep(0.5)  # Small delay to let signal_ready settle
+
+                    # Bridge to async: run end_of_turn in a new event loop
+                    text = self._interrupted_turn_text or "[Turn interrupted by 8-minute reconnection]"
+
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        loop.run_until_complete(end_of_turn(text))
+                        logger.info(f"Successfully advanced to turn {self.turn_idx} after interrupted turn")
+                    except Exception as e:
+                        logger.error(f"Error handling interrupted turn: {e}")
+                    finally:
+                        loop.close()
+
+                    # Reset state
+                    self._was_responding_at_disconnect = False
+                    self._interrupted_turn_text = ""
+
+            threading.Thread(target=delayed_resume, daemon=True).start()
 
         def on_retriggered():
             logger.info("Assistant response re-triggered after reconnection")

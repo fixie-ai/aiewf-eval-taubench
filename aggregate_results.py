@@ -8,12 +8,15 @@ This script:
 4. Groups runs by model and selects the 5 most recent for each
 5. Aggregates scores (tool_use, instruction_following, kb_grounding) across runs
 6. Loads TTFB values from transcript.jsonl for latency statistics
-7. Calculates pass rate: (tool + IF + KB) / (total_turns * 3) * 100
-8. Computes TTFB median, P95, and max across all turns
-9. Outputs a ranked table sorted by pass rate
-10. Saves detailed metadata to a timestamped JSON file
+7. Calculates aggregate pass rate: (tool + IF + KB) / (total_turns * 3) * 100
+8. Calculates median pass rate across individual runs (shows typical performance,
+   less affected by outlier runs with model instability or duplicate tool calls)
+9. Computes TTFB median, P95, and max across all turns
+10. Outputs a ranked table sorted by aggregate pass rate
+11. Saves detailed metadata to a timestamped JSON file
 """
 
+import argparse
 import json
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +38,10 @@ MODEL_MAPPINGS = {
     "gpt-4o-mini": "gpt-4o-mini",
     "claude-sonnet-4-5": "claude-sonnet-4-5",
     "claude-haiku-4-5": "claude-haiku-4-5",
+    # Native audio models
+    "gemini-2.5-flash-native-audio-preview-12-2025": "gemini-native-audio-12",
+    "gemini-2.5-flash-native-audio-preview-09-2025": "gemini-native-audio-09",
+    "gpt-realtime": "gpt-realtime",
 }
 
 
@@ -75,7 +82,22 @@ def load_transcript_ttfb(run_dir: Path) -> list[float]:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Aggregate benchmark results")
+    parser.add_argument("--model", "-m", help="Filter to specific model (e.g., gpt-4o)")
+    parser.add_argument("--runs", "-r", type=int, default=5, help="Number of recent runs per model (default: 5)")
+    args = parser.parse_args()
+
     run_timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+
+    # Determine which models to include
+    if args.model:
+        if args.model not in MODEL_MAPPINGS:
+            print(f"Error: Unknown model '{args.model}'. Available: {list(MODEL_MAPPINGS.keys())}")
+            return
+        models_to_include = {args.model}
+        print(f"Filtering to model: {args.model}, using {args.runs} most recent runs")
+    else:
+        models_to_include = set(MODEL_MAPPINGS.keys())
 
     # Collect ALL runs by model first
     all_runs = defaultdict(list)
@@ -86,7 +108,7 @@ def main():
             continue
 
         model = get_model_from_dir(run_dir.name)
-        if model not in MODEL_MAPPINGS:
+        if model not in models_to_include:
             continue
 
         summary = load_summary(run_dir)
@@ -99,7 +121,7 @@ def main():
             "summary": summary,
         })
 
-    # Now select only the 5 most recent runs per model (sorted by dir name = timestamp)
+    # Now select only the N most recent runs per model (sorted by dir name = timestamp)
     results = defaultdict(lambda: {
         "tool_use": [],
         "instruction_following": [],
@@ -109,11 +131,11 @@ def main():
         "per_run_stats": [],  # Individual run statistics
     })
 
-    for model in MODEL_MAPPINGS:
+    for model in models_to_include:
         runs = all_runs[model]
-        # Sort by directory name (which includes timestamp) and take last 5
+        # Sort by directory name (which includes timestamp) and take last N
         runs_sorted = sorted(runs, key=lambda x: x["name"])
-        recent_runs = runs_sorted[-5:]  # Take the 5 most recent
+        recent_runs = runs_sorted[-args.runs:]  # Take the N most recent
 
         for run in recent_runs:
             passes = run["summary"].get("claude_passes", {})
@@ -148,13 +170,13 @@ def main():
     metadata = {
         "analysis_timestamp": run_timestamp,
         "analysis_time_iso": datetime.now().isoformat(),
-        "runs_per_model": 5,
+        "runs_per_model": args.runs,
         "turns_per_run": 30,
-        "total_turns_per_model": 150,
+        "total_turns_per_model": args.runs * 30,
         "models": {},
     }
 
-    for model in MODEL_MAPPINGS:
+    for model in models_to_include:
         data = results[model]
         if not data["tool_use"]:
             continue
@@ -167,6 +189,10 @@ def main():
         kb_sum = sum(data["kb_grounding"])
 
         pass_rate = (tool_sum + if_sum + kb_sum) / (total_turns * 3) * 100
+
+        # Median pass rate across individual runs (shows typical performance)
+        per_run_pass_rates = [s["pass_rate"] for s in data["per_run_stats"]]
+        median_pass_rate = statistics.median(per_run_pass_rates) if per_run_pass_rates else 0
 
         # TTFB statistics
         ttfb = sorted(data["ttfb_values"])
@@ -184,6 +210,7 @@ def main():
             "instruction_following": f"{if_sum}/{total_turns}",
             "kb_grounding": f"{kb_sum}/{total_turns}",
             "pass_rate": pass_rate,
+            "median_pass_rate": median_pass_rate,
             "ttfb_med": ttfb_med,
             "ttfb_p95": ttfb_p95,
             "ttfb_max": ttfb_max,
@@ -197,6 +224,7 @@ def main():
                 "kb_grounding": kb_sum,
                 "total_turns": total_turns,
                 "pass_rate": round(pass_rate, 2),
+                "median_pass_rate": round(median_pass_rate, 2),
                 "ttfb_median_ms": round(ttfb_med, 1),
                 "ttfb_p95_ms": round(ttfb_p95, 1),
                 "ttfb_max_ms": round(ttfb_max, 1),
@@ -208,8 +236,8 @@ def main():
     aggregated.sort(key=lambda x: x["pass_rate"], reverse=True)
 
     # Output table (without Run Directory column)
-    print("  | Model                                         | Tool Use  | Instruction | KB Ground | Pass Rate     | TTFB Med | TTFB P95 | TTFB Max |")
-    print("  |-----------------------------------------------|-----------|-------------|-----------|---------------|----------|----------|----------|")
+    print("  | Model                | Tool Use  | Instruction | KB Ground | Aggr Rate | Median Rate | TTFB Med | TTFB P95 | TTFB Max |")
+    print("  |----------------------|-----------|-------------|-----------|-----------|-------------|----------|----------|----------|")
 
     for row in aggregated:
         model = row["model"]
@@ -217,11 +245,12 @@ def main():
         instr = row["instruction_following"]
         kb = row["kb_grounding"]
         pass_rate = f"{row['pass_rate']:.1f}%"
+        median_rate = f"{row['median_pass_rate']:.1f}%"
         ttfb_med = f"{int(row['ttfb_med'])}ms"
         ttfb_p95 = f"{int(row['ttfb_p95'])}ms"
         ttfb_max = f"{int(row['ttfb_max'])}ms"
 
-        print(f"  | {model:<45} | {tool:<9} | {instr:<11} | {kb:<9} | {pass_rate:<13} | {ttfb_med:<8} | {ttfb_p95:<8} | {ttfb_max:<8} |")
+        print(f"  | {model:<20} | {tool:<9} | {instr:<11} | {kb:<9} | {pass_rate:<9} | {median_rate:<11} | {ttfb_med:<8} | {ttfb_p95:<8} | {ttfb_max:<8} |")
 
     # Save metadata to timestamped file
     output_file = OUTPUT_DIR / f"analysis_{run_timestamp}.json"

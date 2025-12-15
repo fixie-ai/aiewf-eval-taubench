@@ -2,6 +2,41 @@
 
 A framework for evaluating multi-turn LLM conversations with support for text, realtime audio, and speech-to-speech models.
 
+The two benchmarks here in this public repo are:
+
+- `aiwf_long_context` - older long-context benchmark described [here](https://post-training.aitinkerers.org/p/your-conversation-is-out-of-distribution)
+- `aiwf_medium_context` - newer medium-context benchmark
+
+## aiwf_medium_context results summary for selected models
+
+Text mode models:
+
+```
+| Model                | Tool Use  | Instruction | KB Ground | Pass Rate | Median Rate | TTFB Med | TTFB P95 | TTFB Max |
+|----------------------|-----------|-------------|-----------|-----------|-------------|----------|----------|----------|
+| gpt-5.1              | 300/300   | 300/300     | 300/300   | 100.0%    | 100.0%      | 916ms    | 2011ms   | 5216ms   |
+| claude-sonnet-4-5    | 300/300   | 300/300     | 300/300   | 100.0%    | 100.0%      | 2234ms   | 3062ms   | 5438ms   |
+| gpt-4.1              | 283/300   | 273/300     | 298/300   | 94.9%     | 97.8%       | 683ms    | 1052ms   | 3860ms   |
+| gemini-2.5-flash     | 275/300   | 268/300     | 300/300   | 93.7%     | 94.4%       | 594ms    | 1349ms   | 2104ms   |
+| gpt-5-mini           | 271/300   | 272/300     | 289/300   | 92.4%     | 95.6%       | 6339ms   | 17845ms  | 27028ms  |
+| gpt-4o-mini          | 271/300   | 262/300     | 293/300   | 91.8%     | 92.2%       | 760ms    | 1322ms   | 3256ms   |
+| gpt-4o               | 278/300   | 249/300     | 294/300   | 91.2%     | 95.6%       | 625ms    | 1222ms   | 13378ms  |
+| gpt-5.2              | 224/300   | 228/300     | 250/300   | 78.0%     | 92.2%       | 819ms    | 1483ms   | 1825ms   |
+| claude-haiku-4-5     | 221/300   | 172/300     | 299/300   | 76.9%     | 75.6%       | 732ms    | 1334ms   | 4654ms   |
+```
+
+Speech-to-speech models:
+
+```
+| Rank | Model                         | Tool Use | Instruction | KB Ground | Pass Rate | Median Rate | TTFB Med |
+|------|-------------------------------|----------|-------------|-----------|-----------|-------------|----------|
+| 1    | gpt-realtime                  | 267/300  | 265/300     | 300/300   | 92.4%     | 92.8%       | 818ms    |
+| 2    | gemini-native-audio-12-2025   | 253/300  | 259/300     | 286/300   | 88.7%     | 90.0%       | N/A      |
+| 3    | gemini-native-audio-09-2025   | 236/300  | 227/300     | 268/300   | 81.2%     | 89.4%       | 785ms      |
+```
+
+Each conversation in this benchmark is 30 turns. The scores above are aggregated across 10 runs for each model. **Pass Rate** means the percentage of total turns across all runs that the judge model scored as successful. Each run is also scored independently. **Median Rate** is the median individual run pass rate. Think of pass rate as the model's average performance, and the median rate as a way to measure the model's consistency. The older gemini-native-audio-release, for example, often gave very good performance (89.4% median rate), but was prone to poor runs (81.2% pass rate). The newer release is much more consistent (the overall pass rate is much closer to the median rate).
+
 ## Features
 
 - **Multi-turn conversation evaluation** with configurable benchmarks
@@ -22,10 +57,10 @@ uv sync
 uv run multi-turn-eval list-benchmarks
 
 # Run a benchmark with Claude
-uv run multi-turn-eval run aiwf_long_context --model claude-sonnet-4-5 --service anthropic
+uv run multi-turn-eval run aiwf_medium_context --model claude-sonnet-4-5 --service anthropic
 
 # Judge the results
-uv run multi-turn-eval judge runs/aiwf_long_context/<timestamp>_claude-sonnet-4-5
+uv run multi-turn-eval judge runs/aiwf_medium_context/<timestamp>_claude-sonnet-4-5
 ```
 
 ## Installation
@@ -72,8 +107,8 @@ You can also create a `.env` file in the project root with these variables.
 uv run multi-turn-eval run <benchmark> --model <model> --service <service>
 
 # Examples:
-uv run multi-turn-eval run aiwf_long_context --model claude-sonnet-4-5 --service anthropic
-uv run multi-turn-eval run aiwf_long_context --model gpt-4o --service openai
+uv run multi-turn-eval run aiwf_medium_context --model claude-sonnet-4-5 --service anthropic
+uv run multi-turn-eval run aiwf_medium_context --model gpt-4o --service openai
 uv run multi-turn-eval run aiwf_medium_context --model gemini-2.5-flash --service google
 
 # Realtime audio models (pipeline auto-detected from model name)
@@ -84,10 +119,10 @@ uv run multi-turn-eval run aiwf_medium_context --model gemini-2.5-flash-native-a
 uv run multi-turn-eval run aiwf_medium_context --model amazon.nova-sonic-v1:0 --pipeline nova-sonic
 
 # Debug with limited turns
-uv run multi-turn-eval run aiwf_long_context --model gpt-4o --service openai --only-turns 0,1,2
+uv run multi-turn-eval run aiwf_medium_context --model gpt-4o --service openai --only-turns 0,1,2
 
 # Verbose logging
-uv run multi-turn-eval run aiwf_long_context --model gpt-4o --service openai --verbose
+uv run multi-turn-eval run aiwf_medium_context --model gpt-4o --service openai --verbose
 ```
 
 ### Judging Runs
@@ -96,13 +131,13 @@ After a benchmark run completes, judge the results using Claude:
 
 ```bash
 # Judge a specific run
-uv run multi-turn-eval judge runs/aiwf_long_context/20251213T123456_claude-sonnet-4-5
+uv run multi-turn-eval judge runs/aiwf_medium_context/20251213T123456_claude-sonnet-4-5
 
 # Judge with specific turns
-uv run multi-turn-eval judge runs/aiwf_long_context/20251213T123456_claude-sonnet-4-5 --only-turns 0,1,2
+uv run multi-turn-eval judge runs/aiwf_medium_context/20251213T123456_claude-sonnet-4-5 --only-turns 0,1,2
 
 # Use a different judge model
-uv run multi-turn-eval judge runs/aiwf_long_context/20251213T123456_claude-sonnet-4-5 --judge-model claude-sonnet-4-5
+uv run multi-turn-eval judge runs/aiwf_medium_context/20251213T123456_claude-sonnet-4-5 --judge-model claude-sonnet-4-5
 ```
 
 Judge outputs (saved to the run directory):
@@ -139,7 +174,7 @@ For convenience, common service classes have short aliases:
 You can also use fully-qualified class names:
 
 ```bash
-uv run multi-turn-eval run aiwf_long_context \
+uv run multi-turn-eval run aiwf_medium_context \
     --model gpt-4o \
     --service pipecat.services.openai.llm.OpenAILLMService
 ```
@@ -155,7 +190,7 @@ Benchmarks are located in `benchmarks/`. Each benchmark is a Python package with
 
 | Benchmark | Description | Knowledge Base |
 |-----------|-------------|----------------|
-| `aiwf_long_context` | Long context benchmark | ~24K tokens |
+| `aiwf_long_context` | Long context benchmark | ~40K tokens |
 | `aiwf_medium_context` | Medium context benchmark | ~12K tokens |
 
 Both benchmarks share the same 30 turns, tools, and audio files. Only the knowledge base size differs.
@@ -174,7 +209,7 @@ Runs are saved to `runs/<benchmark>/<timestamp>_<model>/`:
 
 ```
 runs/
-└── aiwf_long_context/
+└── aiwf_medium_context/
     └── 20251213T123456_claude-sonnet-4-5/
         ├── transcript.jsonl        # Turn-by-turn results
         ├── runtime.json            # Run metadata and metrics
@@ -195,7 +230,7 @@ runs/
 | `gemini-2.5-flash-native-audio-preview-12-2025` | realtime | gemini-live |
 | `claude-sonnet-4-5` | text | anthropic |
 | `claude-haiku-4-5` | text | anthropic |
-| `amazon.nova-sonic-v1:0` | nova-sonic | (built-in) |
+| `amazon.nova-2-sonic-v1_0` | nova-sonic | (built-in) |
 
 ## Project Structure
 
