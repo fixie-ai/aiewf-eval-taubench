@@ -215,7 +215,11 @@ class PacedInputTransport(BaseInputTransport):
         # Main loop: send audio or silence
         silence_chunk_bytes = int(sr * (self._chunk_ms / 1000.0)) * self._num_channels * bytes_per_sample
         silence_chunk = bytes(silence_chunk_bytes)
-        last_chunk_time = time.monotonic()
+        chunk_interval_sec = self._chunk_ms / 1000.0
+
+        # Global timing: track when the next chunk should be sent
+        # This ensures accurate timing across outer loop iterations
+        next_chunk_time = time.monotonic()
 
         # Verify silence is actually zeros
         if silence_chunk_bytes > 0:
@@ -230,22 +234,25 @@ class PacedInputTransport(BaseInputTransport):
                 logger.debug(f"{self}: Waiting for LLM ready signal (paused)...")
                 self._llm_ready.wait(timeout=0.5)  # Check periodically so we can respond to stop
                 if not self._llm_ready.is_set():
+                    next_chunk_time = time.monotonic()  # Reset timing after pause
                     continue  # Still not ready, check stop flag and try again
 
             try:
-                audio_bytes, num_channels = self._buf_queue.get(timeout=0.02)
+                # Use non-blocking get when in continuous_silence mode to avoid
+                # double-waiting (queue timeout + chunk pacing). When there's no
+                # audio queued, we want to immediately send silence at real-time pace.
+                timeout = 0 if self._continuous_silence else 0.02
+                audio_bytes, num_channels = self._buf_queue.get(timeout=timeout)
                 has_audio = True
             except queue.Empty:
-                # Log occasionally if we're only sending silence
-                # to debug stalls (every ~2s)
-                if int(time.monotonic() * 10) % 200 == 0:
-                    logger.debug(f"{self}: _feeder_loop no audio in queue; sending silence")
                 has_audio = False
                 # If continuous_silence mode, send silence chunk
                 if self._continuous_silence:
                     audio_bytes = silence_chunk
                     num_channels = self._num_channels
                 else:
+                    # Not in continuous silence mode, wait a bit before checking again
+                    time.sleep(0.02)
                     continue
 
             # Chunking setup
@@ -253,8 +260,6 @@ class PacedInputTransport(BaseInputTransport):
             chunk_bytes = samples_per_chunk * num_channels * bytes_per_sample
             total = len(audio_bytes)
             offset = 0
-            start_t = time.monotonic()
-            chunk_idx = 0
 
             if has_audio:
                 # Log actual audio with sample of first bytes to verify no WAV header
@@ -262,34 +267,31 @@ class PacedInputTransport(BaseInputTransport):
                     f"{self}: SENDING REAL AUDIO: {total} bytes, sr={sr}, ch={num_channels}, "
                     f"first 20 bytes: {list(audio_bytes[:20])}"
                 )
-            # else:
-            #     # Log silence sending (only log once per silence period to avoid spam)
-            #     if chunk_idx == 0:
-            #         logger.debug(
-            #             f"{self}: Sending silence chunk ({silence_chunk_bytes} bytes)"
-            #         )
 
             while offset < total and not self._stop.is_set():
                 end = min(offset + chunk_bytes, total)
                 chunk = audio_bytes[offset:end]
                 offset = end
 
+                # Wait until it's time to send the next chunk (global timing)
+                sleep_for = next_chunk_time - time.monotonic()
+                if sleep_for > 0:
+                    time.sleep(min(sleep_for, 0.05))
+
                 frame = InputAudioRawFrame(audio=chunk, sample_rate=sr, num_channels=num_channels)
                 loop = self.get_event_loop()
                 loop.call_soon_threadsafe(lambda f=frame: self.create_task(self.push_audio_frame(f)))
 
-                # Pace to real time for 20ms per chunk
-                chunk_idx += 1
-                next_time = start_t + (chunk_idx * self._chunk_ms) / 1000.0
-                sleep_for = next_time - time.monotonic()
-                if sleep_for > 0:
-                    time.sleep(min(sleep_for, 0.05))
+                # Schedule next chunk 20ms from the current scheduled time (not from now)
+                # This maintains accurate long-term timing regardless of processing overhead
+                next_chunk_time += chunk_interval_sec
 
             # Only mark task as done if we actually got audio from the queue
             if has_audio:
                 self._buf_queue.task_done()
+                num_chunks = (total + chunk_bytes - 1) // chunk_bytes if chunk_bytes > 0 else 0
                 logger.info(
-                    f"{self}: FINISHED SENDING AUDIO ({total} bytes in {chunk_idx} chunks), "
+                    f"{self}: FINISHED SENDING AUDIO ({total} bytes in {num_chunks} chunks), "
                     f"resuming silence"
                 )
 

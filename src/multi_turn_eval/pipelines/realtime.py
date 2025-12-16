@@ -6,12 +6,13 @@ This pipeline works with speech-to-speech models that use audio input/output:
 
 Pipeline:
     paced_input → context_aggregator.user() → transcript.user() →
-    llm → ToolCallRecorder → assistant_shim → context_aggregator.assistant()
+    llm → ToolCallRecorder → assistant_shim → audio_buffer → context_aggregator.assistant()
 """
 
 import asyncio
 import os
 import time
+import wave
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -19,6 +20,7 @@ import soundfile as sf
 from loguru import logger
 
 from pipecat.frames.frames import (
+    BotStoppedSpeakingFrame,
     Frame,
     InputAudioRawFrame,
     LLMContextFrame,
@@ -32,7 +34,10 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.frames.frames import OutputAudioRawFrame
+import numpy as np
 from pipecat.processors.transcript_processor import TranscriptProcessor
 from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
 from pipecat.services.openai.realtime import events as rt_events
@@ -41,7 +46,86 @@ from pipecat.transports.base_transport import TransportParams
 from multi_turn_eval.pipelines.base import BasePipeline
 from multi_turn_eval.processors.tool_call_recorder import ToolCallRecorder
 from multi_turn_eval.processors.tts_transcript import TTSStoppedAssistantTranscriptProcessor
+from multi_turn_eval.transports.null_audio_output import NullAudioOutputTransport
 from multi_turn_eval.transports.paced_input import PacedInputTransport
+
+
+class TurnGate(FrameProcessor):
+    """Gates turn advancement until bot finishes speaking.
+
+    This processor coordinates between transcript completion and audio playback:
+    1. Stores the pending assistant transcript when received (on TTSStoppedFrame)
+    2. Waits for BotStoppedSpeakingFrame (from NullAudioOutputTransport)
+    3. Adds a small delay to ensure all audio has been processed
+    4. Only then triggers the turn-end callback
+
+    This prevents the next turn's audio from being sent while the bot is
+    still "speaking" (outputting audio frames).
+    """
+
+    def __init__(self, on_turn_ready: Callable[[str], Any], audio_drain_delay: float = 0.5, **kwargs):
+        """Initialize the turn gate.
+
+        Args:
+            on_turn_ready: Async callback to invoke when turn is ready to advance.
+                          Called with the assistant's response text.
+            audio_drain_delay: Seconds to wait after BotStoppedSpeakingFrame before
+                              triggering turn end. This allows remaining audio frames
+                              to drain through the pipeline. Default 0.5s works well
+                              when BOT_VAD_STOP_SECS is increased to 2s.
+        """
+        super().__init__(**kwargs)
+        self._on_turn_ready = on_turn_ready
+        self._audio_drain_delay = audio_drain_delay
+        self._pending_transcript: Optional[str] = None
+        self._bot_speaking = False
+        self._turn_end_task: Optional[asyncio.Task] = None
+
+    def set_pending_transcript(self, text: str):
+        """Store transcript received from assistant_shim.
+
+        Called by the transcript handler when assistant response is complete.
+        The turn won't advance until BotStoppedSpeakingFrame is received.
+        """
+        logger.info(f"[TurnGate] Storing pending transcript ({len(text)} chars)")
+        self._pending_transcript = text
+
+    def clear_pending(self):
+        """Clear any pending transcript (e.g., on reconnection)."""
+        self._pending_transcript = None
+        if self._turn_end_task and not self._turn_end_task.done():
+            self._turn_end_task.cancel()
+            self._turn_end_task = None
+
+    async def _delayed_turn_end(self, text: str):
+        """Wait for audio to drain, then trigger turn end."""
+        try:
+            logger.info(f"[TurnGate] Waiting {self._audio_drain_delay}s for audio to drain...")
+            await asyncio.sleep(self._audio_drain_delay)
+            logger.info(f"[TurnGate] Triggering turn end with transcript ({len(text)} chars)")
+            await self._on_turn_ready(text)
+        except asyncio.CancelledError:
+            logger.info("[TurnGate] Turn end cancelled (likely bot started speaking again)")
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Watch for BotStoppedSpeakingFrame to trigger turn advancement."""
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, BotStoppedSpeakingFrame):
+            logger.info("[TurnGate] BotStoppedSpeakingFrame received")
+            self._bot_speaking = False
+
+            # If we have a pending transcript, schedule turn end after delay
+            if self._pending_transcript is not None:
+                text = self._pending_transcript
+                self._pending_transcript = None
+                # Cancel any existing turn end task
+                if self._turn_end_task and not self._turn_end_task.done():
+                    self._turn_end_task.cancel()
+                # Schedule delayed turn end
+                self._turn_end_task = asyncio.create_task(self._delayed_turn_end(text))
+
+        await self.push_frame(frame, direction)
 
 
 class GeminiLiveLLMServiceWithReconnection(GeminiLiveLLMService):
@@ -150,6 +234,9 @@ class RealtimePipeline(BasePipeline):
         self.paced_input = None
         self.transcript = None
         self.assistant_shim = None
+        self.audio_buffer: Optional[AudioBufferProcessor] = None
+        self.turn_gate: Optional[TurnGate] = None
+        self.output_transport: Optional[NullAudioOutputTransport] = None
         self.current_turn_audio_path: Optional[str] = None
         self.needs_turn_retry: bool = False
         self.reconnection_grace_until: float = 0
@@ -360,7 +447,68 @@ class RealtimePipeline(BasePipeline):
         self.transcript = TranscriptProcessor()
         self.assistant_shim = TTSStoppedAssistantTranscriptProcessor()
 
+        # Create audio buffer processor for recording both user and bot audio
+        logger.info(f"[AudioRecording] Creating AudioBufferProcessor with sample_rate={default_sr}, num_channels=2")
+        self.audio_buffer = AudioBufferProcessor(
+            sample_rate=default_sr,
+            num_channels=2,  # Stereo: user on left channel, bot on right channel
+        )
+
+        # Register event handler to save audio when track data is ready
+        @self.audio_buffer.event_handler("on_track_audio_data")
+        async def on_track_audio_data(
+            processor, user_audio: bytes, bot_audio: bytes, sample_rate: int, num_channels: int
+        ):
+            """Save conversation audio with user and bot on separate channels."""
+            logger.info(
+                f"[AudioRecording] on_track_audio_data triggered: "
+                f"user={len(user_audio)} bytes, bot={len(bot_audio)} bytes, "
+                f"{sample_rate}Hz, {num_channels}ch"
+            )
+
+            # Get run directory from recorder
+            if not self.recorder or not hasattr(self.recorder, "run_dir"):
+                logger.error("[AudioRecording] Cannot save audio: no recorder or run_dir available")
+                return
+
+            # Convert to numpy for processing
+            user_np = np.frombuffer(user_audio, dtype=np.int16)
+            bot_np = np.frombuffer(bot_audio, dtype=np.int16)
+
+            # Pad shorter track to match longer
+            max_len = max(len(user_np), len(bot_np))
+            if len(user_np) < max_len:
+                user_np = np.concatenate([user_np, np.zeros(max_len - len(user_np), dtype=np.int16)])
+            if len(bot_np) < max_len:
+                bot_np = np.concatenate([bot_np, np.zeros(max_len - len(bot_np), dtype=np.int16)])
+
+            # Interleave for stereo: user=left, bot=right
+            stereo = np.zeros(max_len * 2, dtype=np.int16)
+            stereo[0::2] = user_np
+            stereo[1::2] = bot_np
+
+            output_path = self.recorder.run_dir / "conversation.wav"
+            logger.info(f"[AudioRecording] Saving conversation audio to {output_path}")
+
+            try:
+                with wave.open(str(output_path), "wb") as wf:
+                    wf.setnchannels(2)  # Stereo
+                    wf.setsampwidth(2)  # 16-bit audio = 2 bytes per sample
+                    wf.setframerate(sample_rate)
+                    wf.writeframes(stereo.tobytes())
+
+                # Calculate duration for logging
+                duration_secs = max_len / sample_rate
+                file_size_mb = (max_len * 2 * 2) / (1024 * 1024)
+                logger.info(
+                    f"[AudioRecording] Saved conversation audio: {output_path} "
+                    f"({duration_secs:.1f}s, {file_size_mb:.2f}MB)"
+                )
+            except Exception as e:
+                logger.exception(f"[AudioRecording] Failed to save audio: {e}")
+
         # Register event handler for transcript updates
+        # Note: We store the transcript but wait for BotStoppedSpeakingFrame before advancing turn
         @self.assistant_shim.event_handler("on_transcript_update")
         async def on_transcript_update(processor, frame):
             # Check grace period
@@ -378,10 +526,26 @@ class RealtimePipeline(BasePipeline):
                     logger.info(f"Transcript: {line}")
                     # Clear retry flag - turn completed successfully
                     self.needs_turn_retry = False
-                    # Small delay to let downstream settle
-                    await asyncio.sleep(1.0)
-                    # Pass the assistant text directly
-                    await self._on_turn_end(msg.content)
+                    # Store transcript in turn_gate; it will trigger _on_turn_end
+                    # when BotStoppedSpeakingFrame is received
+                    self.turn_gate.set_pending_transcript(msg.content)
+
+        # Create TurnGate to coordinate transcript with audio playback completion
+        self.turn_gate = TurnGate(on_turn_ready=self._on_turn_end)
+
+        # Create null output transport to generate BotStoppedSpeakingFrame
+        # This tracks when the bot finishes "speaking" (outputting audio)
+        # Increase the silence threshold from 0.35s to 2s to handle LLM pauses during generation
+        import pipecat.transports.base_output as base_output_module
+        base_output_module.BOT_VAD_STOP_SECS = 2.0
+        logger.info("[AudioRecording] Set BOT_VAD_STOP_SECS to 2.0s for more reliable turn detection")
+
+        self.output_transport = NullAudioOutputTransport(
+            TransportParams(
+                audio_out_enabled=True,
+                audio_out_sample_rate=default_sr,
+            )
+        )
 
         llm_logger = LLMFrameLogger(recorder_accessor)
 
@@ -394,7 +558,10 @@ class RealtimePipeline(BasePipeline):
                 llm_logger,
                 ToolCallRecorder(recorder_accessor, duplicate_ids_accessor),
                 self.assistant_shim,
+                self.turn_gate,  # Wait for BotStoppedSpeakingFrame before advancing turn
                 self.context_aggregator.assistant(),
+                self.output_transport,  # Paces OutputAudioRawFrame via write_audio_frame()
+                self.audio_buffer,  # Record audio AFTER output_transport pacing
             ]
         )
 
@@ -410,6 +577,10 @@ class RealtimePipeline(BasePipeline):
 
     async def _queue_first_turn(self) -> None:
         """Queue audio for the first turn."""
+        # Start audio recording
+        logger.info("[AudioRecording] Starting audio recording")
+        await self.audio_buffer.start_recording()
+
         # For Gemini Live, push context frame to initialize the LLM with system
         # instruction and tools. This triggers ONE reconnect at startup.
         # For OpenAI Realtime, DO NOT send a context frame - it would force an
