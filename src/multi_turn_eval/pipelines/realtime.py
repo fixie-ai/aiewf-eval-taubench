@@ -20,7 +20,6 @@ from typing import Any, Callable, Dict, Optional
 import numpy as np
 import soundfile as sf
 from loguru import logger
-
 from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
     Frame,
@@ -36,7 +35,9 @@ from pipecat.metrics.metrics import TTFBMetricsData
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+)
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.transcript_processor import TranscriptProcessor
@@ -47,7 +48,6 @@ from pipecat.transports.base_transport import TransportParams
 
 from multi_turn_eval.pipelines.base import BasePipeline
 from multi_turn_eval.processors.tool_call_recorder import ToolCallRecorder
-from multi_turn_eval.processors.tts_to_bot_speaking import TTSToBotSpeakingProcessor
 from multi_turn_eval.processors.tts_transcript import (
     TTSStoppedAssistantTranscriptProcessor,
 )
@@ -385,7 +385,9 @@ class RealtimePipeline(BasePipeline):
         self.assistant_shim.clear_buffer()
         # Set grace period to ignore stale TTSStoppedFrame events that arrive after reconnection
         self.reconnection_grace_until = time.monotonic() + 10.0
-        logger.info(f"Set reconnection grace period until {self.reconnection_grace_until}")
+        logger.info(
+            f"Set reconnection grace period until {self.reconnection_grace_until}"
+        )
 
     def _on_gemini_reconnected(self):
         """Called when Gemini Live reconnection completes."""
@@ -565,6 +567,7 @@ class RealtimePipeline(BasePipeline):
         # This tracks when the bot finishes "speaking" (outputting audio)
         # Increase the silence threshold from 0.35s to 2s to handle LLM pauses during generation
         import pipecat.transports.base_output as base_output_module
+
         base_output_module.BOT_VAD_STOP_SECS = 2.0
         logger.info("[AudioRecording] Set BOT_VAD_STOP_SECS to 2.0s for more reliable turn detection")
 
@@ -586,7 +589,6 @@ class RealtimePipeline(BasePipeline):
                 llm_logger,
                 ToolCallRecorder(recorder_accessor, duplicate_ids_accessor),
                 self.assistant_shim,
-                TTSToBotSpeakingProcessor(),  # Convert TTSStoppedFrame to BotStoppedSpeakingFrame
                 self.turn_gate,  # Wait for BotStoppedSpeakingFrame before advancing turn
                 self.context_aggregator.assistant(),
                 self.output_transport,  # Paces OutputAudioRawFrame via write_audio_frame()

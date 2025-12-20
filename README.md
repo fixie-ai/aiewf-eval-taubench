@@ -237,6 +237,7 @@ runs/
 | `gpt-realtime` | realtime | openai-realtime |
 | `gemini-2.5-flash` | text | google |
 | `gemini-2.5-flash-native-audio-preview-12-2025` | realtime | gemini-live |
+| `ultravox-v0.7` | realtime | ultravox-realtime |
 | `claude-sonnet-4-5` | text | anthropic |
 | `claude-haiku-4-5` | text | anthropic |
 | `amazon.nova-2-sonic-v1_0` | nova-sonic | (built-in) |
