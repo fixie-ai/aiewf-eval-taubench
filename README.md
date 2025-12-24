@@ -1,5 +1,10 @@
 # Multi-Turn Eval
 
+| TauBench commands:
+| `uv run multi-turn-eval run tau_bench_airline --model gpt-4o-realtime-preview --service openai-realtime`
+| `uv run multi-turn-eval run tau_bench_airline --model ultravox-v0.7 --service ultravox-realtime --tts-provider elevenlabs --tts-voice rachel --tts-model eleven_flash_v2_5`
+| `uv run multi-turn-eval judge-tau runs/tau_bench_airline/...`
+
 A framework for evaluating multi-turn LLM conversations with support for text, realtime audio, and speech-to-speech models.
 
 The two benchmarks here in this public repo are:
