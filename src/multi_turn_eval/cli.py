@@ -48,6 +48,8 @@ SERVICE_ALIASES = {
 
 PIPELINE_CLASSES = {
     "text": "multi_turn_eval.pipelines.text.TextPipeline",
+    "tau-bench": "multi_turn_eval.pipelines.tau_bench.TauBenchTextPipeline",
+    "tau-bench-realtime": "multi_turn_eval.pipelines.tau_bench_realtime.TauBenchRealtimePipeline",
     "realtime": "multi_turn_eval.pipelines.realtime.RealtimePipeline",
     "grok-realtime": "multi_turn_eval.pipelines.grok_realtime.GrokRealtimePipeline",
     "nova-sonic": "multi_turn_eval.pipelines.nova_sonic.NovaSonicPipeline",
@@ -177,6 +179,10 @@ def cli():
     help="Pipeline type (text, realtime, nova-sonic). Auto-detected if not specified.",
 )
 @click.option("--only-turns", help="Comma-separated turn indices to run (e.g., 0,1,2)")
+@click.option("--tts-provider", type=click.Choice(["openai", "elevenlabs"]), default="openai",
+              help="TTS provider for realtime pipelines (default: openai)")
+@click.option("--tts-voice", help="TTS voice (OpenAI: nova/alloy/echo, ElevenLabs: rachel/domi/bella)")
+@click.option("--tts-model", help="TTS model (OpenAI: tts-1/tts-1-hd, ElevenLabs: eleven_turbo_v2_5)")
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
 def run(
     benchmark_name: str,
@@ -184,16 +190,28 @@ def run(
     service: Optional[str],
     pipeline: Optional[str],
     only_turns: Optional[str],
+    tts_provider: str,
+    tts_voice: Optional[str],
+    tts_model: Optional[str],
     verbose: bool,
 ):
     """Run a benchmark against an LLM.
 
     Examples:
+        # Text-based evaluation
+        uv run multi-turn-eval run tau_bench_airline --model gpt-4o --service openai
+        
+        # Realtime evaluation with OpenAI TTS (default)
+        uv run multi-turn-eval run tau_bench_airline --model gpt-4o-realtime --service openai-realtime
+        
+        # Realtime evaluation with ElevenLabs TTS
+        uv run multi-turn-eval run tau_bench_airline --model gpt-4o-realtime --service openai-realtime \\
+            --tts-provider elevenlabs --tts-voice rachel
+        
+        # Other benchmarks
         uv run multi-turn-eval run aiwf_long_context --model claude-sonnet-4-5 --service anthropic
-        uv run multi-turn-eval run aiwf_medium_context --model gpt-4o --service openai
-        uv run multi-turn-eval run aiwf_medium_context --model gpt-realtime --service openai-realtime --pipeline realtime
     """
-    asyncio.run(_run(benchmark_name, model, service, pipeline, only_turns, verbose))
+    asyncio.run(_run(benchmark_name, model, service, pipeline, only_turns, tts_provider, tts_voice, tts_model, verbose))
 
 
 async def _run(
@@ -202,6 +220,9 @@ async def _run(
     service: Optional[str],
     pipeline_type: Optional[str],
     only_turns: Optional[str],
+    tts_provider: str,
+    tts_voice: Optional[str],
+    tts_model: Optional[str],
     verbose: bool,
 ):
     """Async implementation of the run command."""
@@ -211,7 +232,21 @@ async def _run(
 
     # Infer pipeline if not specified
     if not pipeline_type:
-        pipeline_type = infer_pipeline(model)
+        # Check if benchmark is TAU-bench style (has expected_actions and uses user simulator)
+        is_tau_bench = benchmark_name.startswith("tau_bench") or getattr(
+            benchmark, "evaluation_mode", None
+        ) == "action_match"
+        
+        if is_tau_bench:
+            # For TAU-bench, check if model is speech-based
+            model_lower = model.lower()
+            if any(x in model_lower for x in ["realtime", "live", "ultravox", "native-audio"]):
+                pipeline_type = "tau-bench-realtime"
+            else:
+                pipeline_type = "tau-bench"
+        else:
+            pipeline_type = infer_pipeline(model)
+        
         click.echo(f"Auto-detected pipeline: {pipeline_type}")
 
     pipeline_cls = get_pipeline_class(pipeline_type)
@@ -244,7 +279,23 @@ async def _run(
 
     # Run the pipeline
     try:
-        pipeline_instance = pipeline_cls(benchmark)
+        # Initialize pipeline with TTS options if it's a realtime pipeline
+        if pipeline_type == "tau-bench-realtime":
+            # Set defaults based on provider
+            if not tts_voice:
+                tts_voice = "nova" if tts_provider == "openai" else "rachel"
+            if not tts_model:
+                tts_model = "tts-1" if tts_provider == "openai" else "eleven_turbo_v2_5"
+            
+            pipeline_instance = pipeline_cls(
+                benchmark,
+                tts_provider=tts_provider,
+                tts_voice=tts_voice,
+                tts_model=tts_model,
+            )
+        else:
+            pipeline_instance = pipeline_cls(benchmark)
+        
         await pipeline_instance.run(
             recorder=recorder,
             model=model,
@@ -377,6 +428,147 @@ def list_aliases():
     click.echo("Service aliases:")
     for alias, cls_path in SERVICE_ALIASES.items():
         click.echo(f"  {alias}: {cls_path}")
+
+
+@cli.command("generate-audio")
+@click.argument("benchmark_name")
+@click.option("--provider", type=click.Choice(["openai", "elevenlabs"]), default="openai",
+              help="TTS provider to use (default: openai)")
+@click.option("--voice", help="Voice to use (provider-specific)")
+@click.option("--model", default="tts-1", help="TTS model (OpenAI: tts-1 or tts-1-hd)")
+@click.option("--force", is_flag=True, help="Regenerate existing audio files")
+def generate_audio(
+    benchmark_name: str,
+    provider: str,
+    voice: Optional[str],
+    model: str,
+    force: bool,
+):
+    """Generate TTS audio for benchmark turns.
+
+    Supports two TTS providers:
+    - openai: Uses OPENAI_API_KEY (recommended, already configured)
+    - elevenlabs: Uses ELEVENLABS_API_KEY (higher quality)
+
+    OpenAI voices: alloy, echo, fable, onyx, nova (default), shimmer
+    ElevenLabs: Use voice ID from their dashboard
+
+    Examples:
+        uv run multi-turn-eval generate-audio tau_bench_airline
+        uv run multi-turn-eval generate-audio tau_bench_airline --provider openai --voice nova
+        uv run multi-turn-eval generate-audio tau_bench_airline --provider elevenlabs
+        uv run multi-turn-eval generate-audio tau_bench_airline --force
+    """
+    if provider == "openai":
+        from multi_turn_eval.tts.openai_tts import generate_audio_for_benchmark
+
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise click.UsageError(
+                "OPENAI_API_KEY environment variable is required."
+            )
+
+        click.echo(f"Generating audio for benchmark: {benchmark_name} (using OpenAI TTS)")
+        click.echo(f"  Voice: {voice or 'nova'}, Model: {model}")
+
+        try:
+            paths = asyncio.run(
+                generate_audio_for_benchmark(benchmark_name, voice, force, model)
+            )
+        except Exception as e:
+            raise click.ClickException(f"Audio generation failed: {e}")
+
+    else:  # elevenlabs
+        from multi_turn_eval.tts.elevenlabs import generate_audio_for_benchmark
+
+        api_key = os.getenv("ELEVENLABS_API_KEY")
+        if not api_key:
+            raise click.UsageError(
+                "ELEVENLABS_API_KEY environment variable is required. "
+                "Get your API key from https://elevenlabs.io"
+            )
+
+        click.echo(f"Generating audio for benchmark: {benchmark_name} (using ElevenLabs)")
+
+        try:
+            paths = asyncio.run(
+                generate_audio_for_benchmark(benchmark_name, voice, force)
+            )
+        except Exception as e:
+            raise click.ClickException(f"Audio generation failed: {e}")
+
+    click.echo(f"Generated {len(paths)} audio files")
+    for path in paths:
+        click.echo(f"  {path}")
+
+
+@cli.command("judge-tau")
+@click.argument("run_dir", type=click.Path(exists=True))
+@click.option("--debug", is_flag=True, help="Enable debug logging")
+def judge_tau(run_dir: str, debug: bool):
+    """Judge a TAU-bench run using action-based evaluation.
+
+    Unlike the semantic Claude judge, TAU-bench evaluation compares:
+    - The tool calls made by the agent
+    - The expected actions from the task definition
+    - Whether actions match in name and arguments
+
+    Examples:
+        uv run multi-turn-eval judge-tau runs/tau_bench_airline/20251223T123456_gpt-4o
+    """
+    from multi_turn_eval.judging.tau_bench_judge import judge_run, write_outputs
+
+    run_path = Path(run_dir)
+
+    # Infer benchmark from path
+    benchmark_name = run_path.parent.name
+
+    # Load transcript
+    transcript_path = run_path / "transcript.jsonl"
+    if not transcript_path.exists():
+        raise click.UsageError(f"No transcript found at {transcript_path}")
+
+    # Load benchmark for expected turns
+    try:
+        BenchmarkConfig = load_benchmark(benchmark_name)
+        benchmark = BenchmarkConfig()
+        expected_turns = benchmark.turns
+    except Exception as e:
+        raise click.UsageError(f"Could not load benchmark '{benchmark_name}': {e}")
+
+    # Check for actions in turns (supports both 'actions' and legacy 'expected_actions')
+    has_actions = any(
+        "actions" in turn or "expected_actions" in turn for turn in expected_turns
+    )
+    if not has_actions:
+        raise click.UsageError(
+            f"Benchmark '{benchmark_name}' does not have actions. "
+            "Use 'judge' command for semantic evaluation instead."
+        )
+
+    # Run TAU-bench judge
+    click.echo(f"Judging with TAU-bench evaluator...")
+    try:
+        result = judge_run(run_path, expected_turns)
+    except Exception as e:
+        raise click.ClickException(f"TAU-bench judgment failed: {e}")
+
+    # Get model name from transcript
+    with open(transcript_path) as f:
+        first_record = json.loads(f.readline())
+        model_name = first_record.get("model_name", "unknown")
+
+    # Write outputs
+    write_outputs(run_path, result, model_name)
+
+    # Print summary
+    summary = result["summary"]
+    click.echo(f"\nTAU-bench Results:")
+    click.echo(f"  Pass Rate: {summary['passed']}/{summary['total_tasks']} ({summary['pass_rate']*100:.1f}%)")
+    click.echo(f"  Average Reward: {summary['avg_reward']:.3f}")
+    click.echo(f"\nOutputs written to:")
+    click.echo(f"  {run_path / 'tau_summary.json'}")
+    click.echo(f"  {run_path / 'tau_analysis.md'}")
 
 
 def main():

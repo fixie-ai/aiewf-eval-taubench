@@ -15,6 +15,7 @@ dependencies = [
   "claude-agent-sdk>=0.1.8",
   "torch>=2.9.1",
   "torchaudio>=2.9.1",
+  "aiohttp>=3.9.0",  # For ElevenLabs TTS API
 ]
 
 [project.scripts]

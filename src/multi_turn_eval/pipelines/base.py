@@ -5,6 +5,7 @@ Each pipeline type (text, realtime, nova-sonic) handles its own specifics.
 """
 
 import asyncio
+import json
 import os
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
@@ -268,35 +269,57 @@ class BasePipeline(ABC):
                 self.recorder.record_ttfb(md.value)
 
     async def _function_catchall(self, params: FunctionCallParams) -> None:
-        """Common function handler - returns success, handles end_session.
+        """Common function handler - invokes tools and handles end_session.
 
         Tool call recording is handled by ToolCallRecorder in the pipeline.
-        This just returns the result and handles the special end_session tool.
+        This invokes the tool (using benchmark's handler if available) and
+        returns the result.
 
-        Duplicate tool calls (same function + args) are detected and skipped
-        to prevent context pollution that can confuse the model.
+        Duplicate detection can be disabled per-benchmark via skip_duplicate_detection.
         """
-        # Create a key for duplicate detection (function_name + args)
-        call_key = (params.function_name, str(params.arguments or {}))
+        # Check if duplicate detection should be skipped (e.g., for TAU-bench)
+        skip_duplicates = getattr(self.benchmark, 'skip_duplicate_detection', False)
+        
+        if not skip_duplicates:
+            # Create a key for duplicate detection (function_name + args)
+            call_key = (params.function_name, str(params.arguments or {}))
 
-        # Check for duplicate tool call
-        if call_key in self._seen_tool_calls:
-            tool_call_id = getattr(params, 'tool_call_id', None)
-            logger.warning(
-                f"Skipping duplicate tool call: {params.function_name} "
-                f"(tool_call_id={tool_call_id})"
-            )
-            # Track this tool_call_id as a duplicate so ToolCallRecorder can filter it
-            if tool_call_id:
-                self._duplicate_tool_call_ids.add(tool_call_id)
-            # Return a result to satisfy the API, but mark it as skipped
-            await params.result_callback({"status": "duplicate_skipped"})
-            return
+            # Check for duplicate tool call
+            if call_key in self._seen_tool_calls:
+                tool_call_id = getattr(params, 'tool_call_id', None)
+                logger.warning(
+                    f"Skipping duplicate tool call: {params.function_name} "
+                    f"(tool_call_id={tool_call_id})"
+                )
+                # Track this tool_call_id as a duplicate so ToolCallRecorder can filter it
+                if tool_call_id:
+                    self._duplicate_tool_call_ids.add(tool_call_id)
+                # Return a result to satisfy the API, but mark it as skipped
+                await params.result_callback({"status": "duplicate_skipped"})
+                return
 
-        # Track this call
-        self._seen_tool_calls.add(call_key)
+            # Track this call
+            self._seen_tool_calls.add(call_key)
 
-        result = {"status": "success"}
+        # Check if benchmark provides a custom tool handler
+        tool_handler = getattr(self.benchmark, 'get_tool_handler', None)
+        if tool_handler is not None:
+            try:
+                handler = tool_handler()
+                result_str = handler(params.function_name, **(params.arguments or {}))
+                # Parse the JSON result
+                import json
+                try:
+                    result = json.loads(result_str)
+                except json.JSONDecodeError:
+                    result = {"result": result_str}
+            except Exception as e:
+                logger.warning(f"Tool handler error for {params.function_name}: {e}")
+                result = {"error": str(e)}
+        else:
+            # Default: return generic success
+            result = {"status": "success"}
+        
         await params.result_callback(result)
 
         # end_session tool: gracefully terminate
@@ -313,6 +336,19 @@ class BasePipeline(ABC):
                 )
             self.recorder.write_summary()
             # Cancel the pipeline task to exit cleanly
+            await self.task.cancel()
+        
+        # transfer_to_human_agents tool: gracefully terminate (TAU-bench)
+        if params.function_name == "transfer_to_human_agents":
+            logger.info("transfer_to_human_agents called - ending run")
+            self.done = True
+            await asyncio.sleep(0.05)
+            if self.turn_idx < len(self.effective_turns):
+                self.recorder.write_turn(
+                    user_text=self.effective_turns[self.turn_idx].get("input", ""),
+                    assistant_text="",
+                )
+            self.recorder.write_summary()
             await self.task.cancel()
 
     # ---- Abstract methods (pipeline-specific) ----
