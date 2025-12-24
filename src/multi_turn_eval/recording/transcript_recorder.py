@@ -141,12 +141,19 @@ class TranscriptRecorder:
         """
         self.turn_results.append({"name": name, "response": response})
 
-    def write_turn(self, *, user_text: str, assistant_text: str):
+    def write_turn(
+        self,
+        *,
+        user_text: str,
+        assistant_text: str,
+        extra_data: dict = None,
+    ):
         """Write the completed turn to the transcript file.
 
         Args:
             user_text: The user's input text for this turn.
             assistant_text: The assistant's response text for this turn.
+            extra_data: Optional extra data to include (e.g., full_conversation for TAU-bench).
         """
         latency_ms = None
         if self.turn_start_monotonic is not None:
@@ -164,6 +171,11 @@ class TranscriptRecorder:
             "ttfb_ms": self.turn_ttfb_ms,
             "latency_ms": latency_ms,
         }
+        
+        # Merge extra data if provided (for TAU-bench full conversation, etc.)
+        if extra_data:
+            rec.update(extra_data)
+        
         self.fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
         self.fp.flush()
         self.total_turns_scored += 1
